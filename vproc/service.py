@@ -1,8 +1,15 @@
-from fastapi import FastAPI
+import re
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from vproc.answer.ask import ask_memory, search_memory
 from vproc.config import load_config
+
+# Filter values are interpolated into a LanceDB SQL-style .where() string, so they must
+# never contain control characters (notably a single quote, which would break out of the
+# clause). Restrict to a safe, generous charset and reject anything else with HTTP 400.
+_FILTER_RE = re.compile(r"[A-Za-z0-9_\-. ]{1,128}")
 
 
 class Query(BaseModel):
@@ -13,14 +20,20 @@ class Query(BaseModel):
     speaker: str | None = None
 
 
+def _safe(value: str, field: str) -> str:
+    if not _FILTER_RE.fullmatch(value):
+        raise HTTPException(status_code=400, detail=f"invalid {field} filter")
+    return value
+
+
 def build_where(q: Query) -> str | None:
     clauses = []
     if q.project:
-        clauses.append(f"project_id = '{q.project}'")
+        clauses.append(f"project_id = '{_safe(q.project, 'project')}'")
     if q.memory:
-        clauses.append(f"memory_id = '{q.memory}'")
+        clauses.append(f"memory_id = '{_safe(q.memory, 'memory')}'")
     if q.speaker:
-        clauses.append(f"speaker = '{q.speaker}'")
+        clauses.append(f"speaker = '{_safe(q.speaker, 'speaker')}'")
     return " AND ".join(clauses) if clauses else None
 
 

@@ -40,3 +40,14 @@ def test_where_filter_built_from_request():
                      ask=fake_ask, search=lambda *a, **k: [])
     TestClient(app).post("/ask", json={"question": "q", "speaker": "Tim V", "memory": "standup"})
     assert "speaker = 'Tim V'" in seen["where"] and "memory_id = 'standup'" in seen["where"]
+
+def test_filter_injection_is_rejected():
+    called = {"n": 0}
+    def fake_ask(store, cfg, question, scorer, where=None):
+        called["n"] += 1
+        return Answer(answered=False, abstained=True, text="x", claims=[], evidence=[])
+    app = create_app(store=object(), scorer=lambda p, h: 1.0, cfg=_cfg(),
+                     ask=fake_ask, search=lambda *a, **k: [])
+    r = TestClient(app).post("/ask", json={"question": "q", "project": "x' OR '1'='1"})
+    assert r.status_code == 400        # malicious filter rejected before any query
+    assert called["n"] == 0            # ask() was never reached
