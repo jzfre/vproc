@@ -22,7 +22,7 @@ not discussed, the system must say so rather than guess.
 - Local OCR of screen content (slides, code, docs, dashboards).
 - Time-aligned **segments** stored in a local hybrid search index.
 - A local **RAG** answerer that produces grounded, cited answers (or "not discussed").
-- A local **MCP server** exposing this to VS Code / Copilot.
+- A local **HTTP service** (REST `+` MCP) exposing this to VS Code / Copilot and any LAN client.
 
 ### Out of scope (v1, may follow later)
 - Standalone CLI / web chat front-ends (the RAG core is reused when we add them).
@@ -43,7 +43,7 @@ meeting). The architecture is unchanged by scale — grounding is the point, not
 | **100% open-source + local** in the pipeline | No proprietary frameworks (⇒ **no** Apple Vision OCR). Whisper, pyannote, Qwen, LanceDB, etc. — all Apache/MIT/BSD. The **only** gated piece is pyannote's model (free HF token + one-time accept; CC-BY-4.0). |
 | **No cloud generation** | Copilot/VS Code is a **front-end only** — it performs **zero** generation. All OCR/ASR/embedding/answering runs on local open models. Confidential content never leaves the owner's machines. |
 | **Endpoint-configurable** | vproc is a base app (ffmpeg, ASR, retrieval, HHEM, MCP) + **3 env-configured AI endpoints** (OCR, embeddings, grounding). Not tied to a machine; runs on macOS in dev. OCR → voyage's 9B vLLM; embeddings/grounding → Mac LM Studio (or voyage's 9B). See §9. |
-| **Models stay resident on endpoints** | No in-flight model reloading (the slow part). voyage's 24 GB holds the already-running 9B; bigger models (e.g. the 32B answerer) live on the Mac's 64 GB. Pipeline logic stays happily sequential — see §9, §11. |
+| **One app + external AI endpoints** | The app holds **all** business logic and exposes an HTTP API; it calls 3 AI endpoints (OCR/embed/grounding). They're external for one reason: we want **local + private**, but **no single box has the RAM to hold every model at once** — so each model runs where there's room, as a plain OpenAI-compatible endpoint. See §9. |
 | **Grounding is sacred** | Anti-hallucination is an *architecture* (Section 6), not a model setting. |
 
 ---
@@ -177,12 +177,14 @@ memory's segments under the *same* schema, each sentence HHEM-gated, with an **e
 
 ## 8. MCP server / VS Code integration
 
-`vproc/mcp_server.py` — official `mcp` Python SDK (FastMCP), **HTTP (streamable) transport**, bound on
-the LAN/Tailscale (`VPROC_MCP_HOST` / `VPROC_MCP_PORT`, default `:8765`). **VS Code / Copilot is *not*
-on the vproc box** — it connects over the network to this HTTP endpoint, so one running server serves
-any editor on the tailnet.
+vproc runs as **one HTTP service** on the LAN (`VPROC_HOST` / `VPROC_PORT`, default `:8765`) that
+encapsulates *all* the business logic — ffmpeg, ASR, retrieval, HHEM, grounding. It exposes that logic
+two ways over the same functions: a **plain REST API** (`POST /ask`, `POST /search`) for any client,
+and an **MCP interface** (`/mcp`, official `mcp` SDK / FastMCP, HTTP transport) so **VS Code / Copilot —
+anywhere on the local network** — can call it as a tool in Agent mode. Nothing runs on the editor's
+machine; it just does `POST http://<vproc-host>:8765/…`.
 
-Tools:
+Operations (exposed as both REST routes and MCP tools):
 - `list_projects()` / `list_memories(project)` — navigation.
 - `search_memory(query, project?, memory?, speaker?, k=8)` → **raw cited verbatim segments**, no
   synthesis (impossible to hallucinate; lets Copilot/owner audit).
@@ -195,8 +197,10 @@ VS Code registration — `.vscode/mcp.json`, top-level key `servers`, HTTP trans
 ```json
 { "servers": { "vproc": { "type": "http", "url": "http://<vproc-host>:8765/mcp" } } }
 ```
-Tools surface in **Copilot Chat Agent mode**. Generation happens **inside vproc** (via the grounding
-endpoint) — Copilot's cloud model never synthesizes, so confidential segments never leave the tailnet.
+Non-Copilot clients hit REST directly, e.g. `POST http://192.168.1.103:8765/ask {"question": "…"}`
+→ grounded, cited JSON. Tools surface in **Copilot Chat Agent mode**. Generation happens **inside
+vproc** (via the grounding endpoint) — Copilot's cloud model never synthesizes, so confidential
+segments never leave the tailnet.
 
 ---
 
@@ -216,15 +220,18 @@ pyannote via MLX/MPS), alignment/chunking, retrieval over **LanceDB**, the optio
 |---|---|---|
 | `VPROC_OCR_BASE_URL` / `VPROC_OCR_MODEL` | `http://voyage:8000/v1` · `QuantTrio/Qwen3.5-9B-AWQ` | voyage's already-running vision vLLM. **OCR is *just* this model call** — nothing else. |
 | `VPROC_EMBED_BASE_URL` / `VPROC_EMBED_MODEL` | Mac LM Studio `http://localhost:1234/v1` · `Qwen3-Embedding-0.6B` | query/segment embeddings |
-| `VPROC_GROUNDING_BASE_URL` / `VPROC_GROUNDING_MODEL` | start at voyage 9B; swap to Mac `Qwen3-32B-AWQ` if needed | the answerer |
+| `VPROC_GROUNDING_BASE_URL` / `VPROC_GROUNDING_MODEL` | **Mac LM Studio** `http://localhost:1234/v1` · `Qwen3-32B-AWQ` *(default)* | the answerer — Mac by default (more context than voyage's 65 K); voyage 9B is the fallback |
 
-- **Why endpoints instead of in-process for these three:** the pipeline is logically **sequential** —
-  the only reason the models live on separate, always-resident endpoints is to **avoid reloading
-  models in-flight** (the slow part). voyage keeps the 9B warm; the Mac's LM Studio keeps its models
-  warm; vproc just calls them.
-- **Dev default:** vproc runs on the **Mac**; `VPROC_EMBED` (and optionally `VPROC_GROUNDING`) → Mac
-  LM Studio `localhost:1234`; `VPROC_OCR` → `voyage:8000` over Tailscale/LAN. All hosts are on the
-  `aqui.technology` tailnet (near wire-speed on the LAN).
+- **Why the models are external endpoints (and split across machines):** we want everything **local +
+  private**, but **no single box has the RAM to hold every model at once**. So each model runs where
+  there's room, exposed as a plain OpenAI-compatible endpoint, and the app just calls it. (Bonus: each
+  stays resident, so there's no reload thrash mid-run.)
+- **Defaults:** `VPROC_OCR` → voyage's running 9B (`voyage:8000`, vision); `VPROC_EMBED` and
+  `VPROC_GROUNDING` → the **Mac** (LM Studio, `localhost:1234`) — grounding on the Mac 32B by default.
+  All hosts on the `aqui.technology` tailnet (near wire-speed on the LAN).
+- **Context window:** voyage's 9B is served at **65 K** (`--max-model-len 65536`). That's actually
+  ample for *retrieval* grounding — we feed only the handful of retrieved segments, never a whole
+  meeting — but grounding defaults to the **Mac 32B** for extra headroom and smoother summaries.
 - **Verify first:** confirm the running `Qwen3.5-9B-AWQ` actually accepts image input
   (`/v1/chat/completions` with an `image_url`) before trusting it for OCR. `/v1/models` is confirmed
   live (logprobs enabled).
@@ -244,7 +251,7 @@ pyannote via MLX/MPS), alignment/chunking, retrieval over **LanceDB**, the optio
 | Embeddings | Qwen3-Embedding | `Qwen3-Embedding-0.6B` | Apache-2.0 |
 | Hybrid store | LanceDB | native FTS (`use_tantivy=False`) | Apache-2.0 |
 | Reranker | Qwen3-Reranker | `Qwen3-Reranker-0.6B` | Apache-2.0 |
-| Answerer (grounding) | Qwen3.5-9B *(default, reuse)* / Qwen3-32B-AWQ *(Mac, optional)* | `QuantTrio/Qwen3.5-9B-AWQ` · `Qwen3-32B-AWQ` | Apache-2.0 |
+| Answerer (grounding) | **Qwen3-32B-AWQ on the Mac** *(default)* / voyage 9B *(fallback)* | `Qwen3-32B-AWQ` · `QuantTrio/Qwen3.5-9B-AWQ` | Apache-2.0 |
 | Faithfulness | Vectara HHEM | `HHEM-2.1-Open` (~440 MB) | Apache-2.0 |
 | Constrained decode | XGrammar / GBNF | vLLM default / llama.cpp | Apache-2.0 / MIT |
 | Front-end | MCP Python SDK | `mcp` 1.27.2 (FastMCP) | MIT |
@@ -252,9 +259,9 @@ pyannote via MLX/MPS), alignment/chunking, retrieval over **LanceDB**, the optio
 **Grounding/answerer** (endpoint `VPROC_GROUNDING_*`): the answerer only *reads provided segments and
 writes a cited answer or abstains* — comprehension + formatting, not world-knowledge reasoning — and
 grounding is enforced **structurally** (code-owned citations, retrieval-gated abstention, HHEM), not by
-model size. So **the 9B is very likely enough**: default the endpoint at voyage's already-running
-`Qwen3.5-9B-AWQ` (zero setup). If multi-segment *summaries* feel thin or citations drift, repoint at
-the Mac's `Qwen3-32B-AWQ` (LM Studio) — one env var. **HHEM** (Vectara HHEM-2.1-Open, ~440 MB NLI) runs
+model size. **Default: the Mac's `Qwen3-32B-AWQ`** (LM Studio) — more context than voyage's 65 K and smoother
+summaries. The 9B is a perfectly good **fallback** (grounding is structural, so even 9B holds the
+contract) when the Mac is busy — one env var. **HHEM** (Vectara HHEM-2.1-Open, ~440 MB NLI) runs
 **in-process in the base app** to double-check each answer sentence against its cited evidence — it is
 not an endpoint. **OCR:** reuse voyage's `Qwen3.5-9B-AWQ`; swap to a dedicated `Qwen3-VL-8B-Instruct`
 only if its OCR proves weak.
@@ -272,9 +279,9 @@ Because the AI models sit on **always-resident endpoints** (no in-flight reload)
 - **Mac (64 GB unified):** runs the **base app** (ffmpeg + WhisperX ≈ 3 GB + pyannote ≈ 2 GB + HHEM
   ≈ 0.5 GB + LanceDB) **plus** LM Studio hosting **embeddings** ≈ 1 GB and, optionally, the **32B
   answerer** ≈ 18–20 GB. Everything co-fits in 64 GB with wide headroom.
-- **Grounding choice drives the only real trade-off:** default it to **voyage's 9B** → queries are
-  cheap and the Mac needs no big model, but answering depends on voyage being up. Point it at the
-  **Mac 32B** → queries are self-contained on the Mac (only ingest-OCR needs voyage). One env var.
+- **Default grounding = Mac 32B** → queries are self-contained on the Mac (only ingest-OCR needs
+  voyage) with more context than voyage's 65 K. Fallback to voyage's 9B if the Mac is busy — one env
+  var; grounding is structural, so 9B still holds the contract.
 
 **Rough timing (2 × 50-min meetings):** OCR on voyage's warm GPU + ASR on the Mac (MLX) overlap; each
 meeting ingests in minutes. Interactive answers return in a few seconds either way.
@@ -321,11 +328,11 @@ meeting ingests in minutes. Interactive answers return in a few seconds either w
 - **Phase 1 — MVP (vertical slice, base app on the Mac):** ingest **one** meeting → frames+pHash →
   Whisper in-process (MLX, *anonymous speakers*) → OCR via `VPROC_OCR` (voyage 9B) → align → segments →
   embed via `VPROC_EMBED` → LanceDB; retrieve + abstention; `ask_memory` via `VPROC_GROUNDING`
-  (default 9B) with code-owned citations + in-process HHEM; `search_memory`; **MCP HTTP server on the
-  LAN, queried from VS Code Agent mode.**
+  (default Mac 32B) with code-owned citations + in-process HHEM; `search_memory`; **HTTP service
+  (REST + MCP) on the LAN, queried from VS Code Agent mode.**
 - **Phase 2 — speakers + summaries:** add diarization (pyannote, in-process) + nameplate name
   resolution → owner confirm; Project/Memory model; optional reranker; `get_meeting_overview` grounded
-  summaries; constrained decoding; (optional) repoint `VPROC_GROUNDING` at the Mac 32B.
+  summaries; constrained decoding; (optional) wire voyage's 9B as a grounding fallback.
 - **Phase 3 — both meetings + harden:** ingest the second meeting; calibrate thresholds; verify the 9B
   accepts images / pin voyage vLLM; (optional) company-key grounding endpoint; (optional) CLI front-end.
 
@@ -342,13 +349,13 @@ vproc/
   store/               # LanceDB schema + hybrid search + metadata filters
   retrieve/            # hybrid retrieve + rerank + score-gate
   answer/              # evidence builder, constrained gen, citation resolver, HHEM gate, summarizer
-  mcp_server.py        # FastMCP HTTP server: list_*, search_memory, ask_memory, get_meeting_overview
+  service.py           # the HTTP service: REST (/ask, /search) + MCP (/mcp) over the same logic
   cli.py               # `vproc ingest <video>` (and the speaker-confirm prompt)
 tests/                 # unit + grounding integration fixtures
 docs/superpowers/specs/2026-06-02-vproc-design.md
 .vscode/mcp.json
 pyproject.toml
-.env                   # VPROC_OCR_* / VPROC_EMBED_* / VPROC_GROUNDING_* / VPROC_MCP_* / VPROC_INDEX_PATH / HF_TOKEN
+.env                   # VPROC_OCR_* / VPROC_EMBED_* / VPROC_GROUNDING_* / VPROC_HOST / VPROC_PORT / VPROC_INDEX_PATH / HF_TOKEN
 ```
 
 ---
@@ -371,9 +378,9 @@ pyproject.toml
 6. **Reused OCR model** — verify `Qwen3.5-9B-AWQ` accepts image input before relying on it; the
    VLM-OCR faithfulness caveat (risk 2) applies. Spot-check OCR quality on a real slide early; if weak,
    swap in a dedicated `Qwen3-VL-8B-Instruct` (config-only change).
-7. **Host availability** — the base app + embeddings run on the Mac; OCR (and, by default, grounding)
-   on voyage. Whichever host a query needs must be up. Default grounding → voyage 9B keeps the Mac
-   model-free; default → Mac 32B makes queries voyage-independent. Pick per how you work.
+7. **Host availability** — the base app + embeddings + **grounding (default)** are the Mac; **OCR** is
+   voyage. A *query* needs the Mac up (embed + grounding); *ingest* additionally needs voyage (OCR).
+   Fallback: repoint grounding to voyage's 9B if the Mac is busy.
 8. **voyage GPU is ~90 % committed** to the running model — never schedule GPU ingest there; ASR runs
    on the Mac (or voyage CPU in the MVP).
 
