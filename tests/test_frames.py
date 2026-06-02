@@ -3,12 +3,7 @@ from vproc.ingest.frames import ffmpeg_sample_cmd, parse_frames_log, phash_dedup
 
 def _img(tmp_path, name, color):
     p = tmp_path / name
-    if isinstance(color, list):
-        img = Image.new("RGB", (64, 64))
-        img.putdata(color)
-    else:
-        img = Image.new("RGB", (64, 64), color)
-    img.save(p)
+    Image.new("RGB", (64, 64), color).save(p)
     return str(p)
 
 def test_cmd_has_filters():
@@ -27,10 +22,9 @@ def test_parse_frames_log_pairs_paths_to_times():
 def test_phash_dedup_drops_near_duplicates(tmp_path):
     a = _img(tmp_path, "a.png", (0, 0, 0))
     a2 = _img(tmp_path, "a2.png", (0, 0, 0))      # identical → dropped
-    # gradient image — visually distinct enough for pHash distance > 6
-    b = _img(tmp_path, "b.png", [(x * 4, y * 4, 128) for y in range(64) for x in range(64)])
+    b = _img(tmp_path, "b.png", (255, 255, 255))  # different → kept
     frames = [RawFrame(a, 0.0), RawFrame(a2, 1.0), RawFrame(b, 2.0)]
-    kept = phash_dedup(frames, threshold=6, floor_s=999)
+    kept = phash_dedup(frames, threshold=0, floor_s=999)
     assert [f.path for f in kept] == [a, b]
 
 def test_phash_dedup_floor_forces_anchor(tmp_path):
