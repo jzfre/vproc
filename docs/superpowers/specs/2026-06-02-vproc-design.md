@@ -42,7 +42,7 @@ the Blackwell box. The architecture is unchanged by scale — grounding is the p
 |---|---|
 | **100% open-source + local** in the pipeline | No proprietary frameworks (⇒ **no** Apple Vision OCR). Whisper, pyannote, Qwen, LanceDB, etc. — all Apache/MIT/BSD. The **only** gated piece is pyannote's model (free HF token + one-time accept; CC-BY-4.0). |
 | **No cloud generation** | Copilot/VS Code is a **front-end only** — it performs **zero** generation. All OCR/ASR/embedding/answering runs on local open models. Confidential content never leaves the owner's machines. |
-| **Cross-platform** | **Dev/test:** Apple Silicon M5 Max (64 GB, Metal/MLX/MPS). **Prod:** Ubuntu Linux + NVIDIA RTX PRO 4000 **Blackwell** (24 GB VRAM, CUDA sm_120). One codebase, backend chosen by config. |
+| **Cross-platform + cross-machine** | One codebase; each model *role* is `{base_url, model_id}` in config, so roles spread across **voyage** (Ubuntu + RTX PRO 4000 Blackwell 24 GB — dev box + vision model) and **universe** (M5 Max Mac, 64 GB — inference workhorse via LM Studio/MLX). Backends: CUDA sm_120 on voyage, Metal/MLX on the Mac. See §9. |
 | **24 GB VRAM is the binding budget** | Size every model against the prod box, not the 64 GB Mac. Exploit that **ingest-time** and **query-time** models are *never co-resident*. |
 | **Grounding is sacred** | Anti-hallucination is an *architecture* (Section 6), not a model setting. |
 
@@ -134,11 +134,14 @@ Module boundaries under `vproc/ingest/` — each does one thing, testable in iso
 | 1 | `frames.py` | Sample screen frames | `ffmpeg … -vf "mpdecimate,select='gt(scene,0.08)',metadata=print:file=frames.log" -fps_mode vfr`. **Must** read `pts_time` from the log — never infer time from filenames. Then pHash dedup (Hamming > ~6 on 64-bit hash) ⇒ one frame per distinct screen. Add a 30 s safety-floor anchor. |
 | 2 | `transcribe.py` | Word-level transcript | WhisperX (faster-whisper `large-v3-turbo` + wav2vec2 forced alignment). VAD on; `condition_on_previous_text=False` (kills repetition loops on silence). **Blackwell: `compute_type="float16"`** (INT8 crashes on sm_120). Mac: CPU transcribe + MPS align. |
 | 3 | `diarize.py` | Who spoke when | pyannote.audio 4.x, `speaker-diarization-community-1` (needs `HF_TOKEN` + one-time accept). Fuse to words by **max temporal overlap** ⇒ speaker-attributed segments. If sm_120 kernel error ⇒ fall back to CPU diarization. |
-| 4 | `ocr.py` | Read screen text | Qwen3-VL-8B-Instruct via OpenAI `/v1`. **Verbatim prompt** ("transcribe only visibly-rendered text; `[illegible]` for unreadable; no inference/translation/spelling-fix"). Request per-line `{bbox_2d, text_content}` JSON. **Verifier:** deterministic OCR (PaddleOCR/docTR) on each bbox crop for char-agreement + token-logprob/2-resolution self-consistency ⇒ tag low-confidence spans `[unverified]`. |
+| 4 | `ocr.py` | Read screen text | voyage's running **Qwen3.5-9B-AWQ** (vision) via `/v1` at `:8000`. **Verbatim prompt** ("transcribe only visibly-rendered text; `[illegible]` for unreadable; no inference/translation/spelling-fix"). Request per-line `{bbox_2d, text_content}` JSON. **Verifier:** deterministic OCR (PaddleOCR/docTR) on each bbox crop for char-agreement + token-logprob/2-resolution self-consistency ⇒ tag low-confidence spans `[unverified]`. |
 | 5 | `names.py` | cluster → real name | Match an OCR'd **nameplate** to the active-speaker time window; require temporal overlap. **Never infer a name from voice.** Suggest → owner confirms once (CLI prompt in v1). Persist `cluster_id → name` + mean speaker-embedding for reuse. No evidence ⇒ keep `SPEAKER_xx`. |
 | 6 | `align.py` | Build segments | Turn deduped frames into screen-state intervals; attach overlapping speaker-attributed transcript; emit `Segment`s + `embed_text`. |
 | 7 | `embed_index.py` | Embed + store | Qwen3-Embedding-0.6B (**instruction prefix on queries only**, `padding_side="left"`). Write vectors + metadata to LanceDB. |
 | `pipeline.py` orchestrates 1→7 for one memory and writes the `Memory` record. |
+
+**Placement (§9):** OCR (4) → voyage `:8000`; ASR + diarization (2–3) → the Mac `vproc-asr` sidecar
+(MLX/MPS); embedding (7) → Mac LM Studio; ffmpeg + orchestration + LanceDB write → vproc on voyage.
 
 **Speakers are fully visible on the nameplates in both target meetings**, so step 5 auto-naming is
 expected to succeed; the manual confirm is a quick safety check.
@@ -194,18 +197,38 @@ Copilot's cloud model synthesize (that would leak confidential segments).
 
 ---
 
-## 9. Cross-platform serving seam
+## 9. Deployment — cross-platform *and* cross-machine
 
-One **OpenAI-compatible `/v1`** endpoint per model role + a config registry
-`{role → {backend, base_url, model_id, dtype}}`. No backend-specific SDK in business logic — only a
-thin client (`vproc/llm/`) knows the backend.
+The seam is one **OpenAI-compatible `/v1` endpoint per model role** + a config registry
+`{role → {base_url, model_id}}`. This makes both *platform* (Metal vs CUDA) and *machine*
+(Mac vs Blackwell box) pure configuration. No backend-specific SDK in business logic — only a thin
+client (`vproc/llm/`) knows the backend. **Chosen placement:**
 
-| Role | Mac (dev) | Blackwell (prod) |
-|---|---|---|
-| VLM-OCR, answerer | vllm-mlx / Ollama 0.19+ (MLX) | vLLM (cu130 image, pinned tag) |
-| ASR | faster-whisper (CPU) / mlx-whisper draft | faster-whisper (CUDA) |
-| Embed / rerank | MLX or sentence-transformers (MPS) | vLLM / sentence-transformers (cu128) |
-| Store | LanceDB (arm64 wheel) | LanceDB (x86_64 wheel) — directory is byte-portable |
+| Role | Model | Host | Endpoint |
+|---|---|---|---|
+| **OCR (vision)** | `QuantTrio/Qwen3.5-9B-AWQ` *(already serving)* | **voyage** (Blackwell) | `http://localhost:8000/v1` |
+| **Answerer** | `Qwen3-32B-AWQ` (LM Studio) | **universe** (Mac) | `http://universe:1234/v1` |
+| **Embeddings** | `Qwen3-Embedding-0.6B` (LM Studio / MLX) | **universe** (Mac) | `http://universe:1234/v1` |
+| **Reranker** | `Qwen3-Reranker-0.6B` | **universe** (Mac) | local / `:1234` |
+| **ASR + diarization** | WhisperX + pyannote (MLX/MPS) | **universe** (Mac) | `vproc-asr` sidecar (HTTP) |
+| **Faithfulness** | HHEM-2.1-Open (~440 MB, CPU) | **voyage** (with vproc) | in-process |
+| **Vector store** | LanceDB (embedded) | **voyage** (with vproc) | local dir |
+
+- **vproc** (ingest CLI + MCP server) runs on **voyage**. OCR is a `localhost` call to the
+  already-running vision model; Mac models are reached over **Tailscale** (`universe`
+  `100.114.198.47` / LAN `192.168.1.169`).
+- **ASR/diarization sidecar:** WhisperX/pyannote are libraries, not `/v1` services, so the Mac runs a
+  tiny `vproc-asr` HTTP service wrapping them (MLX/MPS). voyage's ingest sends `audio.wav`, gets back
+  speaker-attributed words. *(MVP shortcut: run Whisper on voyage's CPU first and add the Mac sidecar
+  with diarization in Phase 2 — see §14.)*
+- **Tailnet:** all hosts are on the `aqui.technology` Tailscale tailnet → near-wire-speed on the same
+  LAN. Prefer `localhost` on voyage; cross-machine over Tailscale. (voyage services currently bind
+  `0.0.0.0`; ufw/API-key hardening is planned — see the `home` infra docs.)
+- **Verify first:** confirm the running `Qwen3.5-9B-AWQ` actually accepts image input
+  (`/v1/chat/completions` with an `image_url`) before trusting it for OCR. `/v1/models` is confirmed
+  live (logprobs enabled — usable for OCR confidence).
+- **Parity / fallback:** every role can be repointed by editing the registry — e.g. all-on-voyage or
+  all-on-Mac for offline testing, or answerer → voyage's 9B if the Mac is off.
 
 ---
 
@@ -216,7 +239,7 @@ thin client (`vproc/llm/`) knows the backend.
 | Demux + frames | ffmpeg + pHash | ffmpeg 7.x (LGPL), imagehash, Pillow | LGPL/BSD/HPND |
 | ASR + word ts | WhisperX | whisperx 3.7.x · faster-whisper 1.2.1 · ct2 4.7.2 · `large-v3-turbo` | BSD/MIT |
 | Diarization | pyannote.audio | 4.x · `speaker-diarization-community-1` (MIT `3.1` fallback) | MIT code / CC-BY-4.0 weights (gated) |
-| Screen OCR | Qwen3-VL | `Qwen3-VL-8B-Instruct` (+`-FP8` prod) | Apache-2.0 |
+| Screen OCR | **reuse voyage's running** Qwen3.5-9B (vision) | `QuantTrio/Qwen3.5-9B-AWQ` @ `voyage:8000` | Apache-2.0 (AWQ) |
 | Embeddings | Qwen3-Embedding | `Qwen3-Embedding-0.6B` | Apache-2.0 |
 | Hybrid store | LanceDB | native FTS (`use_tantivy=False`) | Apache-2.0 |
 | Reranker | Qwen3-Reranker | `Qwen3-Reranker-0.6B` | Apache-2.0 |
@@ -225,30 +248,31 @@ thin client (`vproc/llm/`) knows the backend.
 | Constrained decode | XGrammar / GBNF | vLLM default / llama.cpp | Apache-2.0 / MIT |
 | Front-end | MCP Python SDK | `mcp` 1.27.2 (FastMCP) | MIT |
 
-**Answerer note:** default to the **official `Qwen3-32B-AWQ`** (audit-grade reproducible quant) for a
-grounding-sacred pipeline; its 32K context is ample for a 2-meeting corpus. (Third-party
-`Qwen3.6-27B` quants offer 262K context but are unofficial — kept as an alternative, not the
-default.) **OCR model is config-swappable**: if the prod box already runs a specific Qwen-VL build,
-point the config at it; otherwise pull `Qwen3-VL-8B-Instruct`.
+**Answerer:** **`Qwen3-32B-AWQ`** on the **Mac via LM Studio** (`universe:1234`) — audit-grade quant,
+32 K context (ample for 2 meetings), 64 GB headroom, runs in parallel with voyage's vision model.
+Fallback: voyage's 9B answerer if the Mac is offline (config switch). **OCR:** decided — **reuse
+voyage's already-serving `Qwen3.5-9B-AWQ`** (vision); config-swappable to a dedicated
+`Qwen3-VL-8B-Instruct` if its OCR quality proves insufficient.
 
 ---
 
-## 11. VRAM plan (24 GB Blackwell — the binding box)
+## 11. Resource plan (multi-machine)
 
-Ingest and query models are **never co-resident** — run ingest as a separate batch process, release
-VRAM, then start the query server.
+The old "one model on 24 GB, swap per phase" constraint is **relaxed by distribution** — models live
+on different boxes (§9), so almost nothing competes for the same VRAM:
 
-- **Ingest phase** (sequential sub-steps to be safe): WhisperX ASR FP16 ~1.6–3 GB + wav2vec2 ~0.5 GB;
-  pyannote ~2–3 GB; Qwen3-VL-8B-FP8 OCR ~9–10 GB (+ViT/KV, ~14 GB headroom for high-res tokens). Cap
-  `max_pixels` / `--limit-mm-per-prompt`; pHash-dedup first (don't OCR every frame).
-- **Query phase** (co-resident): Qwen3-Embedding-0.6B ~1.2 GB + Qwen3-Reranker-0.6B ~1.3 GB +
-  HHEM <0.6 GB (CPU-capable) + answerer Qwen3-32B-AWQ ~17–19 GB. Cap `--max-model-len` to 32K and set
-  `--gpu-memory-utilization 0.85`.
-- **Mac (64 GB)**: everything co-fits with room; use it to validate long-context behavior the 24 GB
-  card can't hold.
+- **voyage (24 GB Blackwell):** ~90 % already committed to the running `Qwen3.5-9B-AWQ`
+  (`--gpu-memory-utilization 0.90`). It serves **OCR** and is otherwise left alone — we do **not**
+  load Whisper/diarization on its GPU. Cap OCR `max_pixels` and pHash-dedup first (don't OCR every
+  frame) so a high-res slide's vision tokens don't strain the already-busy card.
+- **universe (Mac, 64 GB unified):** the inference workhorse — **answerer** `Qwen3-32B-AWQ` ≈ 18–20 GB
+  + **embeddings** ≈ 1 GB + **reranker** ≈ 1.3 GB + the **ASR sidecar** (WhisperX ≈ 3 GB + pyannote
+  ≈ 2 GB). All co-fit in 64 GB with wide headroom — this is the "3 models in parallel."
+- **voyage CPU (with vproc):** LanceDB (~0 VRAM) + HHEM faithfulness (~0.5 GB, CPU).
 
-**Rough timing:** Blackwell ingests both meetings in **a few minutes each**; answers in seconds.
-Mac ingest is slower (CPU-bound ASR, ~20–40 min/meeting) but fine for dev + interactive answering.
+**Rough timing (2 × 50-min meetings):** OCR on voyage's warm GPU + ASR on the Mac via MLX run in
+parallel across the two boxes; each meeting ingests in minutes, both comfortably within an afternoon.
+Interactive answers (Mac 32B over Tailscale) return in a few seconds.
 
 ---
 
@@ -288,14 +312,16 @@ Mac ingest is slower (CPU-bound ASR, ~20–40 min/meeting) but fine for dev + in
 
 - **Phase 0 — scaffold:** `uv` project, config registry, `/v1` client abstraction, LanceDB schema,
   data models, MCP server skeleton.
-- **Phase 1 — MVP (vertical slice):** ingest **one** meeting → frames+pHash → WhisperX transcript
-  (*anonymous speakers*) → Qwen3-VL OCR + verifier → align → segments → embed → LanceDB; retrieve +
-  rerank + abstention; `ask_memory` with code-owned citations + HHEM gate; `search_memory`; **working
-  in VS Code Agent mode.** This already answers questions about one meeting.
-- **Phase 2 — speakers + summaries:** diarization → nameplate name resolution → owner confirm;
+- **Phase 1 — MVP (vertical slice, single-machine on voyage):** ingest **one** meeting → frames+pHash →
+  Whisper on **voyage CPU** (*anonymous speakers, no sidecar yet*) → OCR via voyage's running
+  `Qwen3.5-9B` + verifier → align → segments → embed → LanceDB; retrieve + rerank + abstention;
+  `ask_memory` (answerer = Mac LM Studio 32B, or voyage 9B if the Mac is off) with code-owned
+  citations + HHEM gate; `search_memory`; **working in VS Code Agent mode.**
+- **Phase 2 — distribute + speakers + summaries:** stand up the **Mac `vproc-asr` sidecar** (MLX/MPS)
+  for ASR + diarization; nameplate name resolution → owner confirm; full distributed placement (§9);
   Project/Memory model; `get_meeting_overview` grounded summaries; constrained decoding.
-- **Phase 3 — both meetings + harden:** ingest the second meeting; calibrate thresholds; Blackwell
-  deployment + version pinning; (optional) company-key answerer swap; (optional) CLI/web front-end.
+- **Phase 3 — both meetings + harden:** ingest the second meeting; calibrate thresholds; pin voyage
+  vLLM / verify image input; (optional) company-key answerer swap; (optional) CLI/web front-end.
 
 ---
 
@@ -312,6 +338,7 @@ vproc/
   answer/              # evidence builder, constrained gen, citation resolver, HHEM gate, summarizer
   mcp_server.py        # FastMCP: list_*, search_memory, ask_memory, get_meeting_overview
   cli.py               # `vproc ingest <video>` (and the speaker-confirm prompt)
+asr_service/           # Mac-side sidecar: WhisperX + pyannote over HTTP (MLX/MPS)
 tests/                 # unit + grounding integration fixtures
 docs/superpowers/specs/2026-06-02-vproc-design.md
 .vscode/mcp.json
@@ -335,6 +362,13 @@ vproc.toml             # model roles → {backend, base_url, model_id, dtype}, p
    attribution in an MCP "about" resource, or use MIT `3.1`.
 5. **Calibration** — rerank floor + HHEM threshold must be tuned on the real meetings, or the system
    over-/under-refuses.
+6. **Reused OCR model** — verify `Qwen3.5-9B-AWQ` accepts image input before relying on it; the
+   VLM-OCR faithfulness caveat (risk 2) applies. Spot-check OCR quality on a real slide early; if weak,
+   swap in a dedicated `Qwen3-VL-8B-Instruct` (config-only change).
+7. **Mac availability** — answerer/embeddings/ASR live on the Mac (`universe`); if it's off, queries
+   fall back to voyage's 9B answerer (config switch) and ingest waits. Acceptable for a personal tool.
+8. **voyage GPU is ~90 % committed** to the running model — never schedule GPU ingest there; ASR runs
+   on the Mac (or voyage CPU in the MVP).
 
 ---
 
