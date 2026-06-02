@@ -83,6 +83,12 @@ dependencies = [
     "uvicorn>=0.30",
     "mcp>=1.27",
     "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Heavy real-model deps — needed only for real ingest/answering (Task 18), NOT for the
+# offline unit tests (which inject fakes; transformers/mlx-whisper are imported lazily).
+runtime = [
     "transformers>=4.51",
     "torch>=2.4",
     "mlx-whisper>=0.4; sys_platform == 'darwin'",
@@ -1868,6 +1874,7 @@ This task is **manual** (no automated test) — it exercises the real endpoints 
 - [ ] **Step 1: Prepare endpoints**
   - Confirm voyage OCR is reachable: `curl http://voyage:8000/v1/models` lists `QuantTrio/Qwen3.5-9B-AWQ`.
   - In **LM Studio** (Mac), start a server (`http://localhost:1234/v1`) with an **embedding** model (`Qwen3-Embedding-0.6B`) and the **grounding** model (`Qwen3-32B-AWQ`) loaded.
+  - Install real-model deps: `uv sync --extra runtime` (downloads torch/transformers/mlx-whisper).
   - `cp .env.example .env` and adjust hosts if needed. Export them: `set -a && source .env && set +a`.
 
 - [ ] **Step 2: Verify the OCR model accepts an image** (spec risk #6)
