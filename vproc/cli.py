@@ -1,0 +1,22 @@
+import sys
+
+from vproc.config import load_config
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "ingest":
+        from vproc.ingest.pipeline import ingest_video
+
+        n = ingest_video(args[1])
+        print(f"ingested {n} segments from {args[1]}")
+    elif args[:1] == ["serve"]:
+        import uvicorn
+
+        from vproc.service import create_app
+
+        cfg = load_config()
+        uvicorn.run(create_app(), host=cfg.host, port=cfg.port)
+    else:
+        print("usage: vproc [ingest <video.mp4> | serve]")
+        sys.exit(1)
