@@ -20,6 +20,26 @@ def test_segments_from_whisper_filters_empty_and_strips():
     ]
     assert segs[0].speaker == "SPEAKER_0"
 
+def test_segments_from_whisper_collapses_repetition_loop():
+    # Whisper silence-hallucination: a content word looped 20+ times.
+    result = {"segments": [
+        {"start": 0.0, "end": 5.0, "text": "and that's hard " + "struggle " * 20},
+    ]}
+    segs = segments_from_whisper(result)
+    assert segs[0].text.lower().split().count("struggle") == 1
+    assert segs[0].text.startswith("and that's hard")
+
+def test_segments_from_whisper_drops_segment_that_is_pure_repetition():
+    result = {"segments": [{"start": 0.0, "end": 5.0, "text": "the the the the the the"}]}
+    segs = segments_from_whisper(result)
+    # collapses to a single "the" — not dropped, but no longer a loop
+    assert segs[0].text == "the"
+
+def test_segments_from_whisper_keeps_natural_short_repetition():
+    result = {"segments": [{"start": 0.0, "end": 1.0, "text": "no no no"}]}
+    segs = segments_from_whisper(result)
+    assert segs[0].text == "no no no"
+
 def test_transcribe_disables_conditioning_to_curb_hallucination():
     captured = {}
     def fake(audio, path_or_hf_repo, **kw):

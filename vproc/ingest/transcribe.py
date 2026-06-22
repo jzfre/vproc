@@ -15,10 +15,26 @@ def extract_audio_cmd(video: str, out_wav: str) -> list[str]:
     return ["ffmpeg", "-hide_banner", "-i", video, "-ac", "1", "-ar", "16000", "-y", out_wav]
 
 
+def _collapse_repetition(text: str, threshold: int = 4) -> str:
+    """Collapse a word repeated >= `threshold` times in a row down to a single
+    occurrence. Whisper silence-hallucinations loop a token dozens of times
+    ('struggle struggle ...'); natural speech ('no no no') stays under the threshold."""
+    words = text.split()
+    out: list[str] = []
+    i = 0
+    while i < len(words):
+        j = i
+        while j < len(words) and words[j].lower() == words[i].lower():
+            j += 1
+        out.append(words[i]) if j - i >= threshold else out.extend(words[i:j])
+        i = j
+    return " ".join(out)
+
+
 def segments_from_whisper(result: dict) -> list[TranscriptSegment]:
     out: list[TranscriptSegment] = []
     for s in result.get("segments", []):
-        text = (s.get("text") or "").strip()
+        text = _collapse_repetition((s.get("text") or "").strip())
         if text:
             out.append(TranscriptSegment(start=float(s["start"]), end=float(s["end"]), text=text))
     return out
