@@ -44,5 +44,6 @@ def ingest_video(video_path: str, cfg=None, store=None, project_id: str = "defau
         state.on_screen_text = O.ocr_frame(cfg.ocr, state.frame_path)
 
     segments = A.build_segments(project_id, title, video_path, states, transcript)
+    store.delete_memory(title)  # idempotent re-ingest: drop prior rows for this memory
     EI.embed_and_store(cfg, store, segments)
     return len(segments)

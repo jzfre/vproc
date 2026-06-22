@@ -28,6 +28,14 @@ class Store:
         except Exception:
             pass  # FTS is best-effort; vector search still works
 
+    def delete_memory(self, memory_id: str) -> None:
+        """Remove all rows for a memory so re-ingesting replaces rather than duplicates."""
+        table = self._table()
+        if table is None:
+            return
+        safe = memory_id.replace("'", "''")  # escape for the SQL-style filter
+        table.delete(f"memory_id = '{safe}'")
+
     def vector_search(self, vector, k: int, where: str | None = None) -> list[dict]:
         table = self._table()
         if table is None:
