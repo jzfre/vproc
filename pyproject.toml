@@ -20,7 +20,9 @@ dependencies = [
 # Heavy real-model deps — needed only for real ingest/answering (Task 18), NOT for the
 # offline unit tests (which inject fakes; transformers/mlx-whisper are imported lazily).
 runtime = [
-    "transformers>=4.51",
+    # HHEM's trust_remote_code model (modeling_hhem_v2.py) targets the transformers 4.x
+    # API; 5.x renamed internals (all_tied_weights_keys) and breaks model load. Cap <5.
+    "transformers>=4.51,<5",
     "torch>=2.4",
     "mlx-whisper>=0.4; sys_platform == 'darwin'",
 ]
