@@ -52,3 +52,24 @@ def test_transcribe_disables_conditioning_to_curb_hallucination():
     assert captured["condition_on_previous_text"] is False
     assert captured["audio"] == "a.wav"
     assert out == [TranscriptSegment(0.0, 1.0, "hi")]
+
+def test_transcribe_routes_to_asr_endpoint_when_base_url_set():
+    from vproc.config import Endpoint
+    cap = {}
+    def fake_audio(base_url, model, audio_path):
+        cap["base_url"] = base_url; cap["model"] = model; cap["audio"] = audio_path
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": "remote hi"}]}
+    out = transcribe("a.wav", endpoint=Endpoint("http://asr/v1", "whisper-x"), audio_client=fake_audio)
+    assert (cap["base_url"], cap["model"], cap["audio"]) == ("http://asr/v1", "whisper-x", "a.wav")
+    assert out == [TranscriptSegment(0.0, 1.0, "remote hi")]
+
+def test_transcribe_uses_local_when_base_url_empty():
+    from vproc.config import Endpoint
+    cap = {}
+    def fake_local(audio, path_or_hf_repo, **kw):
+        cap["model"] = path_or_hf_repo; cap.update(kw)
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": "local hi"}]}
+    out = transcribe("a.wav", endpoint=Endpoint("", "local-model"), transcriber=fake_local)
+    assert cap["model"] == "local-model"
+    assert cap["condition_on_previous_text"] is False
+    assert out == [TranscriptSegment(0.0, 1.0, "local hi")]

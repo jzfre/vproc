@@ -44,6 +44,17 @@ def chat_json(
     return msg.content or getattr(msg, "reasoning_content", None) or ""
 
 
+def transcribe_audio(base_url: str, model: str, audio_path: str) -> dict:
+    """Transcribe via an OpenAI-compatible ASR endpoint (/v1/audio/transcriptions).
+    Returns the same {"segments": [{start, end, text}]} shape as the local whisper path."""
+    with open(audio_path, "rb") as f:
+        resp = _client(base_url).audio.transcriptions.create(
+            model=model, file=f, response_format="verbose_json"
+        )
+    segs = getattr(resp, "segments", None) or []
+    return {"segments": [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in segs]}
+
+
 def ocr_image(base_url: str, model: str, image_path: str, prompt: str) -> str:
     data = base64.b64encode(open(image_path, "rb").read()).decode()
     mime = mimetypes.guess_type(image_path)[0] or "image/png"

@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from vproc.llm import client
+
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 
 
@@ -40,7 +42,7 @@ def segments_from_whisper(result: dict) -> list[TranscriptSegment]:
     return out
 
 
-def transcribe(audio_path: str, model: str = DEFAULT_MODEL, transcriber=None) -> list[TranscriptSegment]:
+def _transcribe_local(audio_path: str, model: str, transcriber=None) -> dict:
     if transcriber is None:
         import mlx_whisper  # lazy: heavy, Mac-only
 
@@ -48,7 +50,7 @@ def transcribe(audio_path: str, model: str = DEFAULT_MODEL, transcriber=None) ->
     # Anti-hallucination: condition_on_previous_text=False stops the repetition cascade
     # ("Ministry Ministry ...") on silence; the thresholds drop low-confidence / repetitive
     # decodes instead of emitting invented speech.
-    result = transcriber(
+    return transcriber(
         audio_path,
         path_or_hf_repo=model,
         word_timestamps=False,
@@ -57,4 +59,19 @@ def transcribe(audio_path: str, model: str = DEFAULT_MODEL, transcriber=None) ->
         logprob_threshold=-1.0,
         no_speech_threshold=0.6,
     )
+
+
+def transcribe(audio_path: str, endpoint=None, transcriber=None, audio_client=None) -> list[TranscriptSegment]:
+    """Transcribe audio. `endpoint` (a config.Endpoint) selects the backend: an empty
+    base_url runs local in-process whisper; a base_url uses an OpenAI-compatible ASR
+    endpoint. Both paths funnel through segments_from_whisper (so the repetition guard
+    applies regardless of backend)."""
+    from vproc.config import Endpoint
+
+    if endpoint is None:
+        endpoint = Endpoint("", DEFAULT_MODEL)
+    if endpoint.base_url:
+        result = (audio_client or client.transcribe_audio)(endpoint.base_url, endpoint.model, audio_path)
+    else:
+        result = _transcribe_local(audio_path, endpoint.model, transcriber)
     return segments_from_whisper(result)

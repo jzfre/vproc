@@ -16,7 +16,7 @@ def _patch(monkeypatch):
     monkeypatch.setattr(P.F, "phash_dedup", lambda frames, **k: frames)
     monkeypatch.setattr(P, "_read_log", lambda p: "")
     monkeypatch.setattr(P.T, "transcribe",
-                        lambda wav: [TranscriptSegment(1.0, 3.0, "we ship in July")])
+                        lambda wav, ep=None: [TranscriptSegment(1.0, 3.0, "we ship in July")])
     monkeypatch.setattr(P.O, "ocr_frame", lambda ocr, path: "Roadmap Q3")
     monkeypatch.setattr(P.EI, "embed_and_store",
                         lambda cfg, store, segs, **k: store.add(

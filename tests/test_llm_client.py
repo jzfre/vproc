@@ -47,3 +47,29 @@ def test_chat_json_sets_json_format(monkeypatch):
     out = c.chat_json("u", "m", "sys", "usr")
     assert out == "OK"
     assert cap["response_format"] == {"type": "json_object"}
+
+class _Seg:
+    def __init__(self, s, e, t): self.start, self.end, self.text = s, e, t
+
+class _FakeAudioClient:
+    def __init__(self, cap): self.cap = cap
+    @property
+    def audio(self):
+        outer = self
+        class T:
+            def create(self, **kw):
+                outer.cap.update(kw)
+                return type("R", (), {"segments": [_Seg(0.0, 1.0, "hello"), _Seg(1.0, 2.0, "world")]})()
+        return type("A", (), {"transcriptions": T()})()
+
+def test_transcribe_audio_calls_asr_endpoint(tmp_path, monkeypatch):
+    cap = {}
+    monkeypatch.setattr(c, "_client", lambda base_url: _FakeAudioClient(cap))
+    wav = tmp_path / "a.wav"; wav.write_bytes(b"RIFFxxxx")
+    out = c.transcribe_audio("http://x/v1", "whisper-1", str(wav))
+    assert cap["model"] == "whisper-1"
+    assert cap["response_format"] == "verbose_json"
+    assert out == {"segments": [
+        {"start": 0.0, "end": 1.0, "text": "hello"},
+        {"start": 1.0, "end": 2.0, "text": "world"},
+    ]}

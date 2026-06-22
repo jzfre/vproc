@@ -36,7 +36,7 @@ def ingest_video(video_path: str, cfg=None, store=None, project_id: str = "defau
     kept = F.phash_dedup(raw)
 
     subprocess.run(T.extract_audio_cmd(video_path, wav_path), check=True)
-    transcript = T.transcribe(wav_path)
+    transcript = T.transcribe(wav_path, cfg.transcribe)
 
     end_time = transcript[-1].end if transcript else (kept[-1].t if kept else 0.0)
     states = A.build_screen_states(kept, end_time)
