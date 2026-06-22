@@ -24,8 +24,21 @@ def segments_from_whisper(result: dict) -> list[TranscriptSegment]:
     return out
 
 
-def transcribe(audio_path: str, model: str = DEFAULT_MODEL) -> list[TranscriptSegment]:
-    import mlx_whisper  # lazy: heavy, Mac-only
+def transcribe(audio_path: str, model: str = DEFAULT_MODEL, transcriber=None) -> list[TranscriptSegment]:
+    if transcriber is None:
+        import mlx_whisper  # lazy: heavy, Mac-only
 
-    result = mlx_whisper.transcribe(audio_path, path_or_hf_repo=model, word_timestamps=False)
+        transcriber = mlx_whisper.transcribe
+    # Anti-hallucination: condition_on_previous_text=False stops the repetition cascade
+    # ("Ministry Ministry ...") on silence; the thresholds drop low-confidence / repetitive
+    # decodes instead of emitting invented speech.
+    result = transcriber(
+        audio_path,
+        path_or_hf_repo=model,
+        word_timestamps=False,
+        condition_on_previous_text=False,
+        compression_ratio_threshold=2.4,
+        logprob_threshold=-1.0,
+        no_speech_threshold=0.6,
+    )
     return segments_from_whisper(result)

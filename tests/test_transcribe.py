@@ -1,4 +1,6 @@
-from vproc.ingest.transcribe import segments_from_whisper, extract_audio_cmd, TranscriptSegment
+from vproc.ingest.transcribe import (
+    segments_from_whisper, extract_audio_cmd, transcribe, TranscriptSegment,
+)
 
 def test_extract_audio_cmd():
     cmd = extract_audio_cmd("in.mp4", "/o/a.wav")
@@ -17,3 +19,16 @@ def test_segments_from_whisper_filters_empty_and_strips():
         TranscriptSegment(2.0, 3.0, "world"),
     ]
     assert segs[0].speaker == "SPEAKER_0"
+
+def test_transcribe_disables_conditioning_to_curb_hallucination():
+    captured = {}
+    def fake(audio, path_or_hf_repo, **kw):
+        captured["audio"] = audio
+        captured["model"] = path_or_hf_repo
+        captured.update(kw)
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}
+    out = transcribe("a.wav", transcriber=fake)
+    # the load-bearing anti-hallucination flag (stops the "Ministry Ministry" repetition loop)
+    assert captured["condition_on_previous_text"] is False
+    assert captured["audio"] == "a.wav"
+    assert out == [TranscriptSegment(0.0, 1.0, "hi")]
