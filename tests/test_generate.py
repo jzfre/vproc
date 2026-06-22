@@ -6,7 +6,7 @@ def _cfg():
     return Config(ep, ep, ep, "x", "0.0.0.0", 8765, 0.25, 0.5, None)
 
 def test_generate_parses_and_keeps_cited_claims():
-    def fake_chat(base_url, model, system, user):
+    def fake_chat(base_url, model, system, user, **kwargs):
         assert "EVIDENCE" in user
         return '{"answered": true, "claims": [{"text": "ships in July", "evidence_ids": ["E1"]}]}'
     out = generate(_cfg(), "when does it ship?", "[E1] \"ships in July\"", chat=fake_chat)

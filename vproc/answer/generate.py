@@ -10,6 +10,27 @@ SYSTEM = (
     'Respond as strict JSON: {"answered": bool, "claims": [{"text": str, "evidence_ids": [str]}]}'
 )
 
+# Schema for constrained decoding (json_schema response_format). Structurally enforces the
+# {answered, claims:[{text, evidence_ids}]} shape the rest of the pipeline depends on.
+ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answered": {"type": "boolean"},
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["text", "evidence_ids"],
+            },
+        },
+    },
+    "required": ["answered", "claims"],
+}
+
 
 def _parse(raw: str) -> dict:
     try:
@@ -26,6 +47,6 @@ def _parse(raw: str) -> dict:
 
 def generate(cfg, question: str, evidence_block: str, chat=client.chat_json) -> dict:
     user = f"QUESTION:\n{question}\n\nEVIDENCE:\n{evidence_block}\n\nJSON:"
-    data = _parse(chat(cfg.grounding.base_url, cfg.grounding.model, SYSTEM, user))
+    data = _parse(chat(cfg.grounding.base_url, cfg.grounding.model, SYSTEM, user, schema=ANSWER_SCHEMA))
     claims = [c for c in data.get("claims", []) if c.get("evidence_ids")]
     return {"answered": bool(data.get("answered")) and len(claims) > 0, "claims": claims}
