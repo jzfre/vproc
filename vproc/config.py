@@ -1,5 +1,22 @@
 import os
+import pathlib
 from dataclasses import dataclass
+
+DEFAULT_HHEM_MODEL = "vectara/hallucination_evaluation_model"
+
+
+def load_dotenv(path: str = ".env") -> None:
+    """Minimal .env loader: KEY=VALUE lines, ignores blanks/comments/malformed lines, and
+    does NOT override variables already set in the environment. Call from app entry points
+    (cli) so `vproc` works without manually sourcing .env; load_config() itself stays pure."""
+    if not os.path.exists(path):
+        return
+    for line in pathlib.Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
 
 
 @dataclass(frozen=True)
@@ -26,6 +43,7 @@ class Config:
     # Transcription is configurable like the other functions: an empty base_url means
     # local in-process whisper; a base_url means an OpenAI-compatible ASR endpoint.
     transcribe: Endpoint = Endpoint("", DEFAULT_TRANSCRIBE_MODEL)
+    hhem_model: str = DEFAULT_HHEM_MODEL
 
 
 def _ep(prefix: str, default_url: str, default_model: str) -> Endpoint:
@@ -47,4 +65,5 @@ def load_config() -> Config:
         sim_floor=float(os.environ.get("VPROC_SIM_FLOOR", "0.25")),
         hhem_threshold=float(os.environ.get("VPROC_HHEM_THRESHOLD", "0.5")),
         hf_token=os.environ.get("HF_TOKEN"),
+        hhem_model=os.environ.get("VPROC_HHEM_MODEL", DEFAULT_HHEM_MODEL),
     )

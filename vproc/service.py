@@ -44,7 +44,7 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
         store = Store(cfg.index_path)
     if scorer is None:
         from vproc.answer.faithfulness import HHEM
-        scorer = HHEM().score
+        scorer = HHEM(cfg.hhem_model).score
 
     app = FastAPI(title="vproc")
 

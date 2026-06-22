@@ -1,4 +1,29 @@
-from vproc.config import load_config
+import os
+
+from vproc.config import load_config, load_dotenv
+
+def test_hhem_model_default_and_override(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("VPROC_"):
+            monkeypatch.delenv(k, raising=False)
+    assert "vectara" in load_config().hhem_model
+    monkeypatch.setenv("VPROC_HHEM_MODEL", "my-org/hhem")
+    assert load_config().hhem_model == "my-org/hhem"
+
+def test_load_dotenv_sets_without_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("VPROC_NEWVAR", raising=False)
+    monkeypatch.setenv("VPROC_PRESET", "preset")
+    env = tmp_path / ".env"
+    env.write_text("# comment\nVPROC_NEWVAR='fromfile'\nVPROC_PRESET=fromfile\n\nnonsense-line\n")
+    try:
+        load_dotenv(str(env))
+        assert os.environ["VPROC_NEWVAR"] == "fromfile"      # set from file
+        assert os.environ["VPROC_PRESET"] == "preset"        # existing value NOT overridden
+    finally:
+        os.environ.pop("VPROC_NEWVAR", None)
+
+def test_load_dotenv_missing_file_is_noop():
+    load_dotenv("/no/such/.env")  # must not raise
 
 def test_defaults(monkeypatch):
     for k in list(__import__("os").environ):

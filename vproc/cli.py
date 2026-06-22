@@ -1,9 +1,10 @@
 import sys
 
-from vproc.config import load_config
+from vproc.config import load_config, load_dotenv
 
 
 def main() -> None:
+    load_dotenv()  # auto-load ./.env so `vproc` works without manually sourcing it
     args = sys.argv[1:]
     if len(args) >= 2 and args[0] == "ingest":
         from vproc.ingest.pipeline import ingest_video
