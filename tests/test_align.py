@@ -35,3 +35,36 @@ def test_build_segments_skips_empty_states():
     frames = [RawFrame("a.png", 0.0)]
     states = build_screen_states(frames, end_time=10.0)  # no OCR text, no transcript
     assert build_segments("p", "m", "/v.mp4", states, []) == []
+
+def test_build_segments_subsplits_long_monologue_for_citation_precision():
+    # One near-static screen state spanning 0-300s with a 5-minute monologue.
+    frames = [RawFrame("a.png", 0.0)]
+    states = build_screen_states(frames, end_time=300.0)
+    states[0].on_screen_text = "Architecture Diagram"
+    transcript = [TS(i * 60.0, i * 60.0 + 60.0, f"point {i}", speaker="SPEAKER_0") for i in range(5)]
+    segs = build_segments("p", "m", "/v.mp4", states, transcript)
+    # must NOT be a single 5-minute blob — split so citations point at a real moment
+    assert len(segs) > 1
+    # each sub-segment stays within the ~90s window
+    assert all(s.end_ts - s.start_ts <= 90.0 + 1e-6 for s in segs), [s.end_ts - s.start_ts for s in segs]
+    # visual context preserved: every sub-segment keeps the same screen state + OCR
+    assert all(s.screen_state_id == "ss0" for s in segs)
+    assert all(s.on_screen_text == "Architecture Diagram" for s in segs)
+    # full temporal coverage, in chronological order
+    assert segs[0].start_ts == 0.0
+    assert segs[-1].end_ts == 300.0
+    assert [s.start_ts for s in segs] == sorted(s.start_ts for s in segs)
+
+def test_build_segments_splits_on_speaker_change_within_screen_state():
+    # Same screen, two speakers back-to-back, well under the time window.
+    frames = [RawFrame("a.png", 0.0)]
+    states = build_screen_states(frames, end_time=60.0)
+    states[0].on_screen_text = "Agenda"
+    transcript = [
+        TS(1.0, 5.0, "alice speaking", speaker="SPEAKER_0"),
+        TS(6.0, 10.0, "bob replying", speaker="SPEAKER_1"),
+    ]
+    segs = build_segments("p", "m", "/v.mp4", states, transcript)
+    assert len(segs) == 2
+    assert segs[0].speaker == "SPEAKER_0" and segs[0].said_text == "alice speaking"
+    assert segs[1].speaker == "SPEAKER_1" and segs[1].said_text == "bob replying"

@@ -45,25 +45,55 @@ def make_embed_text(on_screen: str, segs: list[TranscriptSegment]) -> str:
     return f"[SCREEN]\n{on_screen}\n[SPOKEN]\n{spoken}"
 
 
+# Sub-split long monologues so one near-static screen doesn't collapse into a single
+# un-citable blob. Each emitted segment spans at most MAX_WINDOW_S seconds.
+MAX_WINDOW_S = 90.0
+
+
+def _subsplit(segs: list[TranscriptSegment], max_window: float) -> list[list[TranscriptSegment]]:
+    """Split an ordered transcript list into chunks, breaking when adding the next
+    segment would exceed `max_window` seconds OR when the speaker changes."""
+    chunks: list[list[TranscriptSegment]] = []
+    cur: list[TranscriptSegment] = []
+    for seg in segs:
+        if cur and (seg.end - cur[0].start > max_window or seg.speaker != cur[-1].speaker):
+            chunks.append(cur)
+            cur = []
+        cur.append(seg)
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _make_segment(project_id: str, memory_id: str, source_video: str,
+                  s: ScreenState, segs: list[TranscriptSegment]) -> Segment:
+    said = " ".join(x.text for x in segs)
+    start = segs[0].start if segs else s.t_start
+    end = segs[-1].end if segs else s.t_end
+    speaker = segs[0].speaker if segs else "SPEAKER_0"
+    return Segment(
+        id=str(uuid.uuid4()),
+        project_id=project_id, memory_id=memory_id, screen_state_id=s.screen_state_id,
+        start_ts=start, end_ts=end, speaker=speaker,
+        said_text=said, on_screen_text=s.on_screen_text, on_screen_confidence=None,
+        frame_path=s.frame_path, source_video=source_video,
+        embed_text=make_embed_text(s.on_screen_text, segs),
+    )
+
+
 def build_segments(project_id: str, memory_id: str, source_video: str,
                    states: list[ScreenState],
-                   transcript: list[TranscriptSegment]) -> list[Segment]:
+                   transcript: list[TranscriptSegment],
+                   max_window: float = MAX_WINDOW_S) -> list[Segment]:
     buckets = assign_segments(states, transcript)
     out: list[Segment] = []
     for s in states:
         segs = buckets[s.screen_state_id]
-        if not segs and not s.on_screen_text.strip():
+        if not segs:
+            # Silent screen with on-screen text still yields one OCR-only segment.
+            if s.on_screen_text.strip():
+                out.append(_make_segment(project_id, memory_id, source_video, s, []))
             continue
-        said = " ".join(x.text for x in segs)
-        start = segs[0].start if segs else s.t_start
-        end = segs[-1].end if segs else s.t_end
-        speaker = segs[0].speaker if segs else "SPEAKER_0"
-        out.append(Segment(
-            id=str(uuid.uuid4()),
-            project_id=project_id, memory_id=memory_id, screen_state_id=s.screen_state_id,
-            start_ts=start, end_ts=end, speaker=speaker,
-            said_text=said, on_screen_text=s.on_screen_text, on_screen_confidence=None,
-            frame_path=s.frame_path, source_video=source_video,
-            embed_text=make_embed_text(s.on_screen_text, segs),
-        ))
+        for chunk in _subsplit(segs, max_window):
+            out.append(_make_segment(project_id, memory_id, source_video, s, chunk))
     return out
