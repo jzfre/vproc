@@ -14,7 +14,8 @@ class TranscriptSegment:
 
 
 def extract_audio_cmd(video: str, out_wav: str) -> list[str]:
-    return ["ffmpeg", "-hide_banner", "-i", video, "-ac", "1", "-ar", "16000", "-y", out_wav]
+    # -nostdin so a backgrounded ingest isn't stopped by SIGTTIN reading the TTY.
+    return ["ffmpeg", "-hide_banner", "-nostdin", "-i", video, "-ac", "1", "-ar", "16000", "-y", out_wav]
 
 
 def _collapse_repetition(text: str, threshold: int = 4) -> str:

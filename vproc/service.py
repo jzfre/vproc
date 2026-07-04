@@ -1,15 +1,13 @@
-import re
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from vproc.answer.ask import ask_memory, search_memory
 from vproc.config import load_config
 
-# Filter values are interpolated into a LanceDB SQL-style .where() string, so they must
-# never contain control characters (notably a single quote, which would break out of the
-# clause). Restrict to a safe, generous charset and reject anything else with HTTP 400.
-_FILTER_RE = re.compile(r"[A-Za-z0-9_\-. ]{1,128}")
+# Filter values are interpolated into a LanceDB SQL-style .where() string. Memory/speaker
+# ids are arbitrary filename stems / diarized names, so accept any short string and just
+# neutralize the SQL-string breakout by doubling single quotes (as Store.delete_memory
+# does). Reject only control characters and over-length values with HTTP 400.
 
 
 class Query(BaseModel):
@@ -21,9 +19,9 @@ class Query(BaseModel):
 
 
 def _safe(value: str, field: str) -> str:
-    if not _FILTER_RE.fullmatch(value):
+    if len(value) > 128 or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise HTTPException(status_code=400, detail=f"invalid {field} filter")
-    return value
+    return value.replace("'", "''")  # escape single quotes for the SQL-style filter
 
 
 def build_where(q: Query) -> str | None:
@@ -46,7 +44,8 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
         from vproc.answer.faithfulness import HHEM
         scorer = HHEM(cfg.hhem_model).score
 
-    app = FastAPI(title="vproc")
+    mcp_app, lifespan = _build_mcp(store, cfg, scorer, ask, search)
+    app = FastAPI(title="vproc", lifespan=lifespan)
 
     @app.get("/healthz")
     def healthz():
@@ -54,34 +53,61 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
 
     @app.post("/ask")
     def ask_route(q: Query):
-        answer = ask(store, cfg, q.question or "", scorer, where=build_where(q))
+        question = q.question or ""
+        if not question.strip():
+            raise HTTPException(status_code=400, detail="question is required")
+        answer = ask(store, cfg, question, scorer, where=build_where(q))
         return answer.model_dump()
 
     @app.post("/search")
     def search_route(q: Query):
-        evidence = search(store, cfg, q.query or q.question or "", where=build_where(q))
+        query = q.query or q.question or ""
+        if not query.strip():
+            raise HTTPException(status_code=400, detail="query is required")
+        evidence = search(store, cfg, query, where=build_where(q))
         return [e.model_dump() for e in evidence]
 
-    _mount_mcp(app, store, cfg, scorer, ask, search)
+    if mcp_app is not None:
+        app.mount("/mcp", mcp_app)
     return app
 
 
-def _mount_mcp(app, store, cfg, scorer, ask, search) -> None:
-    """Expose the same logic as MCP tools at /mcp. Best-effort: if the installed
-    mcp SDK's mounting API differs, REST still works and this is a no-op."""
+def _build_mcp(store, cfg, scorer, ask, search):
+    """Build the MCP streamable-HTTP sub-app plus a FastAPI lifespan that runs its
+    session manager (mounted sub-app lifespans are never executed otherwise). The tools
+    are async and offload the blocking ask/search calls so they don't stall the event
+    loop. Best-effort: on any import/setup failure, return (None, None) and REST still
+    works with no lifespan requirement."""
     try:
+        from contextlib import asynccontextmanager
+
+        import anyio
         from mcp.server.fastmcp import FastMCP
+        from mcp.server.transport_security import TransportSecuritySettings
 
         mcp = FastMCP("vproc")
 
         @mcp.tool()
-        def ask_memory_tool(question: str) -> dict:
-            return ask(store, cfg, question, scorer).model_dump()
+        async def ask_memory_tool(question: str) -> dict:
+            answer = await anyio.to_thread.run_sync(lambda: ask(store, cfg, question, scorer))
+            return answer.model_dump()
 
         @mcp.tool()
-        def search_memory_tool(query: str) -> list:
-            return [e.model_dump() for e in search(store, cfg, query)]
+        async def search_memory_tool(query: str) -> list:
+            hits = await anyio.to_thread.run_sync(lambda: search(store, cfg, query))
+            return [e.model_dump() for e in hits]
 
-        app.mount("/mcp", mcp.streamable_http_app())
+        mcp.settings.streamable_http_path = "/"  # mounted at /mcp -> endpoint is /mcp
+        # This is a LAN service bound to 0.0.0.0 and reached by hostname, so the default
+        # localhost-only DNS-rebinding guard would 421 every remote MCP client.
+        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        mcp_app = mcp.streamable_http_app()
+
+        @asynccontextmanager
+        async def lifespan(app):
+            async with mcp.session_manager.run():
+                yield
+
+        return mcp_app, lifespan
     except Exception:
-        pass
+        return None, None

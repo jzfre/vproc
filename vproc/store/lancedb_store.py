@@ -11,16 +11,23 @@ class Store:
         self.db = lancedb.connect(path)
 
     def _table(self):
-        if self.TABLE in self.db.table_names():
+        # open_table directly; table_names() is paginated (default limit 10) and
+        # would hide the table in a dir with many tables.
+        try:
             return self.db.open_table(self.TABLE)
-        return None
+        except ValueError:
+            return None
 
     def add(self, rows: list[dict]) -> None:
         if not rows:
             return
         table = self._table()
         if table is None:
-            table = self.db.create_table(self.TABLE, data=rows)
+            try:
+                table = self.db.create_table(self.TABLE, data=rows)
+            except ValueError:  # a concurrent ingest created it first
+                table = self.db.open_table(self.TABLE)
+                table.add(rows)
         else:
             table.add(rows)
         try:
@@ -28,13 +35,25 @@ class Store:
         except Exception:
             pass  # FTS is best-effort; vector search still works
 
-    def delete_memory(self, memory_id: str) -> None:
-        """Remove all rows for a memory so re-ingesting replaces rather than duplicates."""
+    def delete_memory(self, memory_id: str, project_id: str | None = None,
+                      keep_ids: list[str] | None = None) -> None:
+        """Remove all rows for a memory so re-ingesting replaces rather than duplicates.
+        Scope to project_id when given so distinct videos sharing a filename stem
+        don't destroy each other's rows. keep_ids spares freshly-inserted rows so a
+        re-ingest adds new rows first and deletes only the stale ones — a mid-reingest
+        failure then duplicates instead of destroys."""
         table = self._table()
         if table is None:
             return
         safe = memory_id.replace("'", "''")  # escape for the SQL-style filter
-        table.delete(f"memory_id = '{safe}'")
+        cond = f"memory_id = '{safe}'"
+        if project_id is not None:
+            safe_proj = project_id.replace("'", "''")
+            cond += f" AND project_id = '{safe_proj}'"
+        if keep_ids:
+            kept = ",".join("'%s'" % i.replace("'", "''") for i in keep_ids)
+            cond += f" AND id NOT IN ({kept})"
+        table.delete(cond)
 
     def vector_search(self, vector, k: int, where: str | None = None) -> list[dict]:
         table = self._table()

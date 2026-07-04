@@ -6,6 +6,7 @@ def test_extract_audio_cmd():
     cmd = extract_audio_cmd("in.mp4", "/o/a.wav")
     assert cmd[:1] == ["ffmpeg"]
     assert "-ar" in cmd and "16000" in cmd and cmd[-1] == "/o/a.wav"
+    assert "-nostdin" in cmd  # don't read the TTY: backgrounded ingests must not stop on SIGTTIN
 
 def test_segments_from_whisper_filters_empty_and_strips():
     result = {"segments": [

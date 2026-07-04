@@ -12,3 +12,13 @@ def test_ocr_frame_calls_endpoint_with_prompt():
     assert calls["base_url"] == "http://voyage:8000/v1"
     assert calls["image_path"] == "/frame.png"
     assert "verbatim" in OCR_PROMPT.lower() or "only" in OCR_PROMPT.lower()
+
+
+def test_ocr_frame_normalizes_no_content_sentinel():
+    ep = Endpoint("u", "m")
+    for reply in ("[no shared content]", "  [No Shared Content]  ", '"[NO SHARED CONTENT]"',
+                  "'[no shared content]'"):
+        assert ocr_frame(ep, "/f.png", chat=lambda *a, r=reply: r) == ""
+    # real content is preserved verbatim
+    assert ocr_frame(ep, "/f.png", chat=lambda *a: "Slide: [no shared content] appears here") \
+        == "Slide: [no shared content] appears here"

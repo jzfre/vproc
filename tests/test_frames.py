@@ -22,7 +22,10 @@ def test_cmd_has_filters():
     cmd = ffmpeg_sample_cmd("in.mp4", "/out", "/out/frames.log", scene=0.08)
     joined = " ".join(cmd)
     assert "mpdecimate" in joined and "gt(scene,0.08)" in joined
+    # eq(n,0) keeps the first frame so the opening screen / a scene-change-free video is captured
+    assert "eq(n,0)" in joined
     assert "metadata=print:file=/out/frames.log" in joined
+    assert "-nostdin" in cmd
 
 def test_parse_frames_log_pairs_paths_to_times():
     log = "frame:0 pts_time:0.000000\nframe:1 pts_time:12.500000\n"

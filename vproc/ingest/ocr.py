@@ -16,4 +16,9 @@ OCR_PROMPT = (
 
 
 def ocr_frame(ocr: Endpoint, image_path: str, chat=client.ocr_image) -> str:
-    return chat(ocr.base_url, ocr.model, image_path, OCR_PROMPT).strip()
+    text = chat(ocr.base_url, ocr.model, image_path, OCR_PROMPT).strip()
+    # Normalize the "no shared content" sentinel to empty so it isn't indexed as citable
+    # evidence (build_segments skips empty on_screen_text).
+    if text.strip("\"' \t").lower() == "[no shared content]":
+        return ""
+    return text

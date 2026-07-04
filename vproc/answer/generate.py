@@ -36,17 +36,29 @@ def _parse(raw: str) -> dict:
     try:
         return json.loads(raw)
     except Exception:
-        i, j = raw.find("{"), raw.rfind("}")
-        if i >= 0 and j > i:
-            try:
-                return json.loads(raw[i:j + 1])
-            except Exception:
-                pass
+        pass
+    # Thinking models emit reasoning (often restating the schema, braces and all) around the
+    # JSON, so scan every '{' for the first object json can actually decode.
+    text = raw.replace("```json", "").replace("```", "")
+    dec = json.JSONDecoder()
+    i = text.find("{")
+    while i != -1:
+        try:
+            return dec.raw_decode(text[i:])[0]
+        except Exception:
+            i = text.find("{", i + 1)
     return {"answered": False, "claims": []}
 
 
 def generate(cfg, question: str, evidence_block: str, chat=client.chat_json) -> dict:
     user = f"QUESTION:\n{question}\n\nEVIDENCE:\n{evidence_block}\n\nJSON:"
     data = _parse(chat(cfg.grounding.base_url, cfg.grounding.model, SYSTEM, user, schema=ANSWER_SCHEMA))
-    claims = [c for c in data.get("claims", []) if c.get("evidence_ids")]
+    data = data if isinstance(data, dict) else {}
+    raw_claims = data.get("claims")
+    claims = [
+        c for c in (raw_claims if isinstance(raw_claims, list) else [])
+        if isinstance(c, dict) and isinstance(c.get("text"), str)
+        and isinstance(c.get("evidence_ids"), list)
+        and c["evidence_ids"] and all(isinstance(e, str) for e in c["evidence_ids"])
+    ]
     return {"answered": bool(data.get("answered")) and len(claims) > 0, "claims": claims}

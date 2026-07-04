@@ -45,6 +45,18 @@ def test_abstains_when_hhem_rejects_all():
                      _retrieve=fake_retrieve, _generate=fake_generate)
     assert ans.text == ABSTAIN
 
+def test_claim_evidence_ids_filtered_to_returned_evidence():
+    def fake_retrieve(store, cfg, q, k=8, where=None):
+        return [_hit("s1", "cars are electric now")], 0.9
+    def fake_generate(cfg, q, block):
+        return {"answered": True,
+                "claims": [{"text": "cars are electric now", "evidence_ids": ["E1", "E99"]}]}
+    ans = ask_memory(None, _cfg(), "q", scorer=lambda p, h: 0.9,
+                     _retrieve=fake_retrieve, _generate=fake_generate)
+    keys = {e.key for e in ans.evidence}
+    assert ans.claims[0].evidence_ids == ["E1"]          # dangling E99 dropped
+    assert all(eid in keys for eid in ans.claims[0].evidence_ids)
+
 def test_search_memory_returns_evidence():
     def fake_retrieve(*a, **k):
         return [_hit("s1", "cars")], 0.9

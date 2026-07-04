@@ -1,17 +1,26 @@
 import base64
 import mimetypes
+import wave
 
 from openai import OpenAI
 
+_clients: dict[str, OpenAI] = {}
+
 
 def _client(base_url: str) -> OpenAI:
-    # api_key is required by the SDK but unused by local servers
-    return OpenAI(base_url=base_url, api_key="not-needed")
+    # api_key is required by the SDK but unused by local servers. Cache one client per
+    # base_url so the httpx connection pool is reused instead of leaking a socket per call.
+    inst = _clients.get(base_url)
+    if inst is None:
+        inst = _clients[base_url] = OpenAI(base_url=base_url, api_key="not-needed")
+    return inst
 
 
 def embed_texts(base_url: str, model: str, texts: list[str]) -> list[list[float]]:
     resp = _client(base_url).embeddings.create(model=model, input=texts)
-    return [list(d.embedding) for d in resp.data]
+    # The API pairs each vector to its input via `index`; list order is not contractual.
+    data = sorted(resp.data, key=lambda d: d.index)
+    return [list(d.embedding) for d in data]
 
 
 def chat_json(
@@ -44,19 +53,34 @@ def chat_json(
     return msg.content or getattr(msg, "reasoning_content", None) or ""
 
 
+def _wav_duration(path: str) -> float:
+    with wave.open(path, "rb") as w:
+        return w.getnframes() / float(w.getframerate())
+
+
 def transcribe_audio(base_url: str, model: str, audio_path: str) -> dict:
     """Transcribe via an OpenAI-compatible ASR endpoint (/v1/audio/transcriptions).
     Returns the same {"segments": [{start, end, text}]} shape as the local whisper path."""
     with open(audio_path, "rb") as f:
-        resp = _client(base_url).audio.transcriptions.create(
+        # Hour-long meetings exceed the SDK's 600s default; max_retries=0 so a slow response
+        # doesn't silently re-upload the ~100MB wav two more times.
+        resp = _client(base_url).with_options(timeout=3600, max_retries=0).audio.transcriptions.create(
             model=model, file=f, response_format="verbose_json"
         )
     segs = getattr(resp, "segments", None) or []
-    return {"segments": [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in segs]}
+    if segs:
+        return {"segments": [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in segs]}
+    # Backends that downgrade verbose_json return only `text`; synthesize one segment
+    # spanning the whole recording rather than dropping the transcript. No text = true silence.
+    text = (getattr(resp, "text", None) or "").strip()
+    if not text:
+        return {"segments": []}
+    return {"segments": [{"start": 0.0, "end": _wav_duration(audio_path), "text": text}]}
 
 
 def ocr_image(base_url: str, model: str, image_path: str, prompt: str) -> str:
-    data = base64.b64encode(open(image_path, "rb").read()).decode()
+    with open(image_path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
     mime = mimetypes.guess_type(image_path)[0] or "image/png"
     resp = _client(base_url).chat.completions.create(
         model=model,
@@ -66,4 +90,4 @@ def ocr_image(base_url: str, model: str, image_path: str, prompt: str) -> str:
         ]}],
         temperature=0.0,
     )
-    return resp.choices[0].message.content
+    return resp.choices[0].message.content or ""

@@ -10,6 +10,9 @@ def main() -> None:
         from vproc.ingest.pipeline import ingest_video
 
         n = ingest_video(args[1])
+        if n == 0:
+            print(f"warning: 0 segments ingested from {args[1]} (no transcript or on-screen text)",
+                  file=sys.stderr)
         print(f"ingested {n} segments from {args[1]}")
     elif args[:1] == ["serve"]:
         import uvicorn

@@ -34,12 +34,13 @@ def ask_memory(store, cfg, question: str, scorer, where: str | None = None, k: i
     out_claims: list[Claim] = []
     lines: list[str] = []
     for c in kept:
+        valid_ids = [k for k in c["evidence_ids"] if k in by_key]
         cites = [
             Citation(memory_title=by_key[k].memory_title, start_ts=by_key[k].start_ts,
                      end_ts=by_key[k].end_ts, speaker=by_key[k].speaker)
-            for k in c["evidence_ids"] if k in by_key
+            for k in valid_ids
         ]
-        out_claims.append(Claim(text=c["text"], evidence_ids=c["evidence_ids"], citations=cites))
+        out_claims.append(Claim(text=c["text"], evidence_ids=valid_ids, citations=cites))
         tags = " ".join(_cite_tag(cit) for cit in cites)
         lines.append(f"{c['text']} {tags}".strip())
 

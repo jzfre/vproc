@@ -12,8 +12,11 @@ class RawFrame:
 
 
 def ffmpeg_sample_cmd(video: str, out_dir: str, log_path: str, scene: float = 0.08) -> list[str]:
-    vf = f"mpdecimate,select='gt(scene,{scene})',metadata=print:file={log_path}"
-    return ["ffmpeg", "-hide_banner", "-i", video, "-vf", vf,
+    # eq(n,0) forces the first frame through: its scene score is 0, so gt(scene,...) alone
+    # drops the opening screen and emits nothing at all for a static/scene-change-free video.
+    # -nostdin so a backgrounded ingest isn't stopped by SIGTTIN reading the TTY.
+    vf = f"mpdecimate,select='eq(n,0)+gt(scene,{scene})',metadata=print:file={log_path}"
+    return ["ffmpeg", "-hide_banner", "-nostdin", "-i", video, "-vf", vf,
             "-fps_mode", "vfr", "-frame_pts", "1", f"{out_dir}/%08d.png"]
 
 

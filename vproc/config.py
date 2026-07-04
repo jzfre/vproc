@@ -16,7 +16,16 @@ def load_dotenv(path: str = ".env") -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+        key = key.strip().removeprefix("export ").strip()  # allow shell-sourceable `export KEY=...`
+        if not key:  # e.g. `=foo`; os.environ.setdefault('') raises OSError
+            continue
+        val = val.strip()
+        if val[:1] in ("'", '"'):  # quoted: take the quoted span, drop anything after the close quote
+            end = val.find(val[0], 1)
+            val = val[1:end] if end != -1 else val[1:]
+        else:  # unquoted: drop an inline ` # comment`
+            val = val.split(" #", 1)[0].strip()
+        os.environ.setdefault(key, val)
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,7 @@ class Config:
     # local in-process whisper; a base_url means an OpenAI-compatible ASR endpoint.
     transcribe: Endpoint = Endpoint("", DEFAULT_TRANSCRIBE_MODEL)
     hhem_model: str = DEFAULT_HHEM_MODEL
+    frames_dir: str = "./vproc_frames"
 
 
 def _ep(prefix: str, default_url: str, default_model: str) -> Endpoint:
@@ -66,4 +76,5 @@ def load_config() -> Config:
         hhem_threshold=float(os.environ.get("VPROC_HHEM_THRESHOLD", "0.5")),
         hf_token=os.environ.get("HF_TOKEN"),
         hhem_model=os.environ.get("VPROC_HHEM_MODEL", DEFAULT_HHEM_MODEL),
+        frames_dir=os.environ.get("VPROC_FRAMES_DIR", "./vproc_frames"),
     )

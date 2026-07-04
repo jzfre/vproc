@@ -12,8 +12,15 @@ def _row(seg: Segment, vector: list[float]) -> dict:
     }
 
 
-def embed_and_store(cfg, store, segments: list[Segment], embed=client.embed_texts) -> None:
+def embed_rows(cfg, segments: list[Segment], embed=client.embed_texts) -> list[dict]:
+    """Embed the segments and build store rows WITHOUT writing. Kept separate from the
+    store write so ingest can embed before deleting prior rows (a failed embed must not
+    leave the memory wiped)."""
     if not segments:
-        return
+        return []
     vectors = embed(cfg.embed.base_url, cfg.embed.model, [s.embed_text for s in segments])
-    store.add([_row(seg, vec) for seg, vec in zip(segments, vectors)])
+    return [_row(seg, vec) for seg, vec in zip(segments, vectors)]
+
+
+def embed_and_store(cfg, store, segments: list[Segment], embed=client.embed_texts) -> None:
+    store.add(embed_rows(cfg, segments, embed))

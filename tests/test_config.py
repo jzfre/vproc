@@ -25,6 +25,48 @@ def test_load_dotenv_sets_without_override(tmp_path, monkeypatch):
 def test_load_dotenv_missing_file_is_noop():
     load_dotenv("/no/such/.env")  # must not raise
 
+def test_load_dotenv_export_prefix(tmp_path, monkeypatch):
+    monkeypatch.delenv("VPROC_EXPORTED", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("export VPROC_EXPORTED=http://voyage:8000/v1\n")
+    try:
+        load_dotenv(str(env))
+        assert os.environ["VPROC_EXPORTED"] == "http://voyage:8000/v1"
+        assert "export VPROC_EXPORTED" not in os.environ
+    finally:
+        os.environ.pop("VPROC_EXPORTED", None)
+
+def test_load_dotenv_strips_inline_comment(tmp_path, monkeypatch):
+    monkeypatch.delenv("VPROC_PORTISH", raising=False)
+    monkeypatch.delenv("VPROC_URLISH", raising=False)
+    env = tmp_path / ".env"
+    env.write_text('VPROC_PORTISH=8765  # service port\n'
+                   'VPROC_URLISH="http://voyage:8000/v1"  # embeddings\n')
+    try:
+        load_dotenv(str(env))
+        assert os.environ["VPROC_PORTISH"] == "8765"
+        assert os.environ["VPROC_URLISH"] == "http://voyage:8000/v1"
+    finally:
+        os.environ.pop("VPROC_PORTISH", None)
+        os.environ.pop("VPROC_URLISH", None)
+
+def test_load_dotenv_empty_key_is_ignored(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("=foo\n = bar\nVPROC_OK=ok\n")
+    try:
+        load_dotenv(str(env))  # must not raise OSError on the empty-key lines
+        assert os.environ["VPROC_OK"] == "ok"
+    finally:
+        os.environ.pop("VPROC_OK", None)
+
+def test_frames_dir_default_and_override(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("VPROC_"):
+            monkeypatch.delenv(k, raising=False)
+    assert load_config().frames_dir == "./vproc_frames"
+    monkeypatch.setenv("VPROC_FRAMES_DIR", "/data/frames")
+    assert load_config().frames_dir == "/data/frames"
+
 def test_defaults(monkeypatch):
     for k in list(__import__("os").environ):
         if k.startswith("VPROC_"):

@@ -27,3 +27,33 @@ def test_generate_recovers_from_noisy_json():
 
 def test_system_prompt_forbids_outside_knowledge():
     assert "only" in SYSTEM.lower() and "outside" in SYSTEM.lower()
+
+def test_generate_survives_malformed_but_valid_json():
+    # valid JSON, wrong shape: claims null / strings / top-level array must not crash
+    for raw in ('{"answered": true, "claims": null}',
+                '{"answered": true, "claims": ["ships in July [E1]"]}',
+                '[{"text": "x", "evidence_ids": ["E1"]}]'):
+        out = generate(_cfg(), "q", "[E1] \"x\"", chat=lambda *a, r=raw, **k: r)
+        assert out["answered"] is False and out["claims"] == []
+
+def test_generate_drops_claims_with_non_string_evidence_ids():
+    def fake_chat(*a, **k):
+        return '{"answered": true, "claims": [{"text": "x", "evidence_ids": [1, 2]}]}'
+    out = generate(_cfg(), "q", "[E1] \"x\"", chat=fake_chat)
+    assert out["answered"] is False and out["claims"] == []
+
+def test_generate_extracts_json_after_leading_brace_reasoning():
+    def fake_chat(*a, **k):
+        return ('Reasoning: the schema is {"answered": bool, "claims": [...]}. '
+                'Final answer: {"answered": true, '
+                '"claims": [{"text": "ships in July", "evidence_ids": ["E1"]}]}')
+    out = generate(_cfg(), "q", "[E1] \"x\"", chat=fake_chat)
+    assert out["answered"] is True
+    assert out["claims"] == [{"text": "ships in July", "evidence_ids": ["E1"]}]
+
+def test_generate_strips_markdown_code_fences():
+    def fake_chat(*a, **k):
+        return ('```json\n{"answered": true, '
+                '"claims": [{"text": "ships in July", "evidence_ids": ["E1"]}]}\n```')
+    out = generate(_cfg(), "q", "[E1] \"x\"", chat=fake_chat)
+    assert out["answered"] is True and out["claims"][0]["text"] == "ships in July"
