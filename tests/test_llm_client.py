@@ -29,6 +29,7 @@ class _FakeClient:
     def __init__(self, capture, embed_order=None):
         self.embeddings = _FakeEmbeddings(embed_order)
         self.chat = _FakeChat(capture)
+    def with_options(self, **kw): return self
 
 def test_embed_texts(monkeypatch):
     monkeypatch.setattr(c, "_client", lambda base_url: _FakeClient({}))
@@ -60,7 +61,8 @@ def test_ocr_image_none_content_returns_empty(tmp_path, monkeypatch):
                     msg = type("M", (), {"content": None})()
                     return type("R", (), {"choices": [type("Ch", (), {"message": msg})()]})()
             return C()
-    monkeypatch.setattr(c, "_client", lambda base_url: type("X", (), {"chat": _NoneChat()})())
+    monkeypatch.setattr(c, "_client", lambda base_url: type(
+        "X", (), {"chat": _NoneChat(), "with_options": lambda self, **kw: self})())
     img = tmp_path / "f.png"; img.write_bytes(b"\x89PNG\r\n\x1a\n")
     assert c.ocr_image("u", "m", str(img), "P") == ""
 

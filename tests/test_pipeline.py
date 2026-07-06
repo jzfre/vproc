@@ -35,6 +35,7 @@ def _cfg(tmp_path):
         ocr=ep, embed=ep, transcribe=ep,
         index_path=str(tmp_path / "db.lance"),
         frames_dir=str(tmp_path / "frames"),
+        ocr_timeout=60.0,
     )
 
 
@@ -67,7 +68,7 @@ def _patch(monkeypatch, tmp_path, frames=None, transcript=None, has_audio=True):
     monkeypatch.setattr(P.F, "phash_dedup", lambda fr, **k: list(fr))
     monkeypatch.setattr(P, "_read_log", lambda p: "")
     monkeypatch.setattr(P.T, "transcribe", lambda wav, ep=None: list(ts))
-    monkeypatch.setattr(P.O, "ocr_frame", lambda ocr, path: "Roadmap Q3")
+    monkeypatch.setattr(P.O, "ocr_frame", lambda ocr, path, timeout=None: "Roadmap Q3")
     monkeypatch.setattr(P.EI, "embed_rows", lambda cfg, segs, **k: [_row_of(s) for s in segs])
 
 
@@ -115,6 +116,18 @@ def test_zero_frames_still_indexes_transcript(tmp_path, monkeypatch):
     n = P.ingest_video("/videos/webcam.mp4", cfg=_cfg(tmp_path), store=store)
     assert n >= 1
     assert any("we ship in July" in r["said_text"] for r in store.rows)
+
+
+def test_ocr_failure_degrades_to_transcript(tmp_path, monkeypatch):
+    # A slow/broken vision backend must not discard the transcript: OCR is best-effort per frame.
+    _patch(monkeypatch, tmp_path)
+    def boom(ocr, path, timeout=None):
+        raise TimeoutError("vision backend too slow")
+    monkeypatch.setattr(P.O, "ocr_frame", boom)
+    store = FakeStore()
+    n = P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=store)
+    assert n >= 1  # transcript still indexed despite OCR failing on every frame
+    assert all(r["on_screen_text"] == "" for r in store.rows)
 
 
 def test_trailing_frame_after_speech_not_inverted(tmp_path, monkeypatch):

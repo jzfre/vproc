@@ -54,6 +54,7 @@ class Config:
     transcribe: Endpoint = Endpoint("", DEFAULT_TRANSCRIBE_MODEL)
     hhem_model: str = DEFAULT_HHEM_MODEL
     frames_dir: str = "./vproc_frames"
+    ocr_timeout: float = 60.0  # per-frame OCR cap; slow vision backend -> empty screen text, not a stall
 
 
 def _ep(prefix: str, default_url: str, default_model: str) -> Endpoint:
@@ -77,4 +78,5 @@ def load_config() -> Config:
         hf_token=os.environ.get("HF_TOKEN"),
         hhem_model=os.environ.get("VPROC_HHEM_MODEL", DEFAULT_HHEM_MODEL),
         frames_dir=os.environ.get("VPROC_FRAMES_DIR", "./vproc_frames"),
+        ocr_timeout=float(os.environ.get("VPROC_OCR_TIMEOUT", "60")),
     )

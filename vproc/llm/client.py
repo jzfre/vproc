@@ -78,11 +78,13 @@ def transcribe_audio(base_url: str, model: str, audio_path: str) -> dict:
     return {"segments": [{"start": 0.0, "end": _wav_duration(audio_path), "text": text}]}
 
 
-def ocr_image(base_url: str, model: str, image_path: str, prompt: str) -> str:
+def ocr_image(base_url: str, model: str, image_path: str, prompt: str, timeout: float = 60.0) -> str:
     with open(image_path, "rb") as f:
         data = base64.b64encode(f.read()).decode()
     mime = mimetypes.guess_type(image_path)[0] or "image/png"
-    resp = _client(base_url).chat.completions.create(
+    # Bounded timeout + no retries: a slow vision backend degrades one frame's OCR (caller
+    # falls back to empty on_screen_text) instead of hanging the whole ingest for 600s x N.
+    resp = _client(base_url).with_options(timeout=timeout, max_retries=0).chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": [
             {"type": "text", "text": prompt},

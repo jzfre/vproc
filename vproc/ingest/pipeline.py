@@ -2,6 +2,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 
 from vproc.config import load_config
@@ -64,7 +65,13 @@ def ingest_video(video_path: str, cfg=None, store=None, project_id: str = "defau
             states = [A.ScreenState("ss0", 0.0, end_time, "")]
         for state in states:
             if state.frame_path:
-                state.on_screen_text = O.ocr_frame(cfg.ocr, state.frame_path)  # OCR reads workdir PNGs
+                try:
+                    state.on_screen_text = O.ocr_frame(cfg.ocr, state.frame_path, cfg.ocr_timeout)
+                except Exception as e:
+                    # OCR is best-effort: a slow/broken vision backend must not discard the
+                    # (valuable) transcript. Degrade this frame to no on-screen text and warn.
+                    print(f"warning: OCR failed for {state.frame_path}: {e}", file=sys.stderr)
+                    state.on_screen_text = ""
 
         # Bake the FINAL durable paths into rows now, but defer the physical move until the
         # embed succeeds: any failure before the swap must leave the prior frames intact.
