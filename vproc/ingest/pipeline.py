@@ -66,7 +66,8 @@ def ingest_video(video_path: str, cfg=None, store=None, project_id: str = "defau
         for state in states:
             if state.frame_path:
                 try:
-                    state.on_screen_text = O.ocr_frame(cfg.ocr, state.frame_path, cfg.ocr_timeout)
+                    state.on_screen_text = O.ocr_frame(
+                        cfg.ocr, state.frame_path, cfg.ocr_timeout, cfg.ocr_max_tokens)
                 except Exception as e:
                     # OCR is best-effort: a slow/broken vision backend must not discard the
                     # (valuable) transcript. Degrade this frame to no on-screen text and warn.

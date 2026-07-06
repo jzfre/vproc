@@ -78,12 +78,16 @@ def transcribe_audio(base_url: str, model: str, audio_path: str) -> dict:
     return {"segments": [{"start": 0.0, "end": _wav_duration(audio_path), "text": text}]}
 
 
-def ocr_image(base_url: str, model: str, image_path: str, prompt: str, timeout: float = 60.0) -> str:
+def ocr_image(base_url: str, model: str, image_path: str, prompt: str,
+              timeout: float = 60.0, max_tokens: int = 1024) -> str:
     with open(image_path, "rb") as f:
         data = base64.b64encode(f.read()).decode()
     mime = mimetypes.guess_type(image_path)[0] or "image/png"
-    # Bounded timeout + no retries: a slow vision backend degrades one frame's OCR (caller
-    # falls back to empty on_screen_text) instead of hanging the whole ingest for 600s x N.
+    # OCR is transcription, not reasoning. Cap the output AND disable the model's thinking
+    # channel: a Qwen-style reasoning model otherwise "thinks" about a screenshot until it
+    # burns the whole context (65k tokens over many minutes) and returns no text. Bounded
+    # timeout + no retries so a slow frame degrades (caller falls back to empty on_screen_text)
+    # instead of stalling the ingest. chat_template_kwargs is ignored by non-thinking backends.
     resp = _client(base_url).with_options(timeout=timeout, max_retries=0).chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": [
@@ -91,5 +95,7 @@ def ocr_image(base_url: str, model: str, image_path: str, prompt: str, timeout: 
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}},
         ]}],
         temperature=0.0,
+        max_tokens=max_tokens,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     return resp.choices[0].message.content or ""

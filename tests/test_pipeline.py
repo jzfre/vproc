@@ -36,6 +36,7 @@ def _cfg(tmp_path):
         index_path=str(tmp_path / "db.lance"),
         frames_dir=str(tmp_path / "frames"),
         ocr_timeout=60.0,
+        ocr_max_tokens=1024,
     )
 
 
@@ -68,7 +69,7 @@ def _patch(monkeypatch, tmp_path, frames=None, transcript=None, has_audio=True):
     monkeypatch.setattr(P.F, "phash_dedup", lambda fr, **k: list(fr))
     monkeypatch.setattr(P, "_read_log", lambda p: "")
     monkeypatch.setattr(P.T, "transcribe", lambda wav, ep=None: list(ts))
-    monkeypatch.setattr(P.O, "ocr_frame", lambda ocr, path, timeout=None: "Roadmap Q3")
+    monkeypatch.setattr(P.O, "ocr_frame", lambda ocr, path, timeout=None, max_tokens=None: "Roadmap Q3")
     monkeypatch.setattr(P.EI, "embed_rows", lambda cfg, segs, **k: [_row_of(s) for s in segs])
 
 
@@ -121,7 +122,7 @@ def test_zero_frames_still_indexes_transcript(tmp_path, monkeypatch):
 def test_ocr_failure_degrades_to_transcript(tmp_path, monkeypatch):
     # A slow/broken vision backend must not discard the transcript: OCR is best-effort per frame.
     _patch(monkeypatch, tmp_path)
-    def boom(ocr, path, timeout=None):
+    def boom(ocr, path, timeout=None, max_tokens=None):
         raise TimeoutError("vision backend too slow")
     monkeypatch.setattr(P.O, "ocr_frame", boom)
     store = FakeStore()

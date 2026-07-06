@@ -15,8 +15,10 @@ OCR_PROMPT = (
 )
 
 
-def ocr_frame(ocr: Endpoint, image_path: str, timeout: float = 60.0, chat=client.ocr_image) -> str:
-    text = chat(ocr.base_url, ocr.model, image_path, OCR_PROMPT, timeout=timeout).strip()
+def ocr_frame(ocr: Endpoint, image_path: str, timeout: float = 60.0,
+              max_tokens: int = 1024, chat=client.ocr_image) -> str:
+    text = chat(ocr.base_url, ocr.model, image_path, OCR_PROMPT,
+                timeout=timeout, max_tokens=max_tokens).strip()
     # Normalize the "no shared content" sentinel to empty so it isn't indexed as citable
     # evidence (build_segments skips empty on_screen_text).
     if text.strip("\"' \t").lower() == "[no shared content]":

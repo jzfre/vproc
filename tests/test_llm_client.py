@@ -51,6 +51,9 @@ def test_ocr_image_builds_data_url(tmp_path, monkeypatch):
     content = cap["messages"][0]["content"]
     assert content[0]["text"] == "PROMPT"
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    # OCR must cap output and disable the reasoning channel (else a thinking model runs away)
+    assert cap["max_tokens"] == 1024
+    assert cap["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
 
 def test_ocr_image_none_content_returns_empty(tmp_path, monkeypatch):
     class _NoneChat:
