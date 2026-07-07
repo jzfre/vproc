@@ -38,6 +38,7 @@ def chat_json(
     user: str,
     temperature: float = 0.1,
     schema: dict | None = None,
+    max_tokens: int = 8192,
 ) -> str:
     # Prefer constrained decoding (json_schema) when a schema is given; fall back to the
     # looser json_object mode otherwise. Newer OpenAI-compatible servers (e.g. current
@@ -49,11 +50,16 @@ def chat_json(
         }
     else:
         response_format = {"type": "json_object"}
+    # max_tokens bounds a reasoning model's thinking channel: unbounded, some questions
+    # send it into a runaway loop that fills the context over many minutes. Thinking stays
+    # ON (it measurably improves grounding accuracy); a truncated runaway yields unparseable
+    # output, which the caller treats as an abstention.
     resp = _client(base_url).chat.completions.create(
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=temperature,
         response_format=response_format,
+        max_tokens=max_tokens,
     )
     msg = resp.choices[0].message
     # Some thinking models (e.g. Qwen3 via LM Studio) emit the constrained JSON into the
