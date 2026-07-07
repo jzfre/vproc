@@ -6,8 +6,9 @@ class _Resp:
     def __init__(self, payload): self._p = payload
 
 class _FakeEmbeddings:
-    def __init__(self, order=None): self.order = order
+    def __init__(self, order=None): self.order = order; self.batch_sizes = []
     def create(self, model, input):
+        self.batch_sizes.append(len(input))
         class D:  # noqa: N801
             def __init__(self, e, i): self.embedding = e; self.index = i
         order = self.order if self.order is not None else list(range(len(input)))
@@ -41,6 +42,17 @@ def test_embed_texts_sorts_by_index(monkeypatch):
     monkeypatch.setattr(c, "_client", lambda base_url: _FakeClient({}, embed_order=[1, 0]))
     out = c.embed_texts("u", "m", ["a", "bb"])
     assert out == [[1.0], [2.0]]
+
+def test_embed_texts_chunks_large_batches(monkeypatch):
+    # Embedding servers cap the per-request batch (TEI: 32); a long video's segments must
+    # be sent in chunks, with results concatenated in input order.
+    fake = _FakeClient({})
+    monkeypatch.setattr(c, "_client", lambda base_url: fake)
+    texts = ["x" * (i + 1) for i in range(70)]
+    out = c.embed_texts("u", "m", texts)
+    assert len(out) == 70
+    assert out == [[float(i + 1)] for i in range(70)]  # order preserved across chunks
+    assert fake.embeddings.batch_sizes == [32, 32, 6]  # no request exceeds the cap
 
 def test_ocr_image_builds_data_url(tmp_path, monkeypatch):
     cap = {}

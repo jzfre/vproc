@@ -16,11 +16,19 @@ def _client(base_url: str) -> OpenAI:
     return inst
 
 
+# Embedding servers cap the per-request batch (TEI defaults to 32); send chunks that fit
+# any backend rather than one request holding every segment of a long video.
+EMBED_BATCH = 32
+
+
 def embed_texts(base_url: str, model: str, texts: list[str]) -> list[list[float]]:
-    resp = _client(base_url).embeddings.create(model=model, input=texts)
-    # The API pairs each vector to its input via `index`; list order is not contractual.
-    data = sorted(resp.data, key=lambda d: d.index)
-    return [list(d.embedding) for d in data]
+    out: list[list[float]] = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        resp = _client(base_url).embeddings.create(model=model, input=texts[i:i + EMBED_BATCH])
+        # The API pairs each vector to its input via `index`; list order is not contractual.
+        data = sorted(resp.data, key=lambda d: d.index)
+        out.extend(list(d.embedding) for d in data)
+    return out
 
 
 def chat_json(
