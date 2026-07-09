@@ -57,6 +57,9 @@ class Config:
     ocr_timeout: float = 60.0  # per-frame OCR cap; slow vision backend -> empty screen text, not a stall
     ocr_max_tokens: int = 1024  # bound OCR output so a reasoning vision model can't run away
     grounding_max_tokens: int = 8192  # bound grounding thinking+JSON; a runaway truncates to an abstention
+    # Thinking ON = better answers, ~60-90s/question on a reasoning model; OFF = seconds,
+    # but measurably worse grounding (an answerable question flipped to abstention in A/B).
+    grounding_thinking: bool = True
 
 
 def _ep(prefix: str, default_url: str, default_model: str) -> Endpoint:
@@ -83,4 +86,6 @@ def load_config() -> Config:
         ocr_timeout=float(os.environ.get("VPROC_OCR_TIMEOUT", "60")),
         ocr_max_tokens=int(os.environ.get("VPROC_OCR_MAX_TOKENS", "1024")),
         grounding_max_tokens=int(os.environ.get("VPROC_GROUNDING_MAX_TOKENS", "8192")),
+        grounding_thinking=os.environ.get("VPROC_GROUNDING_THINKING", "on").strip().lower()
+        not in ("0", "false", "off", "no"),
     )

@@ -53,7 +53,8 @@ def _parse(raw: str) -> dict:
 def generate(cfg, question: str, evidence_block: str, chat=client.chat_json) -> dict:
     user = f"QUESTION:\n{question}\n\nEVIDENCE:\n{evidence_block}\n\nJSON:"
     data = _parse(chat(cfg.grounding.base_url, cfg.grounding.model, SYSTEM, user,
-                       schema=ANSWER_SCHEMA, max_tokens=cfg.grounding_max_tokens))
+                       schema=ANSWER_SCHEMA, max_tokens=cfg.grounding_max_tokens,
+                       think=cfg.grounding_thinking))
     data = data if isinstance(data, dict) else {}
     raw_claims = data.get("claims")
     claims = [

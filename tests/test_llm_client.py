@@ -87,6 +87,13 @@ def test_chat_json_sets_json_format(monkeypatch):
     out = c.chat_json("u", "m", "sys", "usr")
     assert out == "OK"
     assert cap["response_format"] == {"type": "json_object"}
+    assert "extra_body" not in cap  # thinking stays on by default: no template override sent
+
+def test_chat_json_think_off_disables_reasoning(monkeypatch):
+    cap = {}
+    monkeypatch.setattr(c, "_client", lambda base_url: _FakeClient(cap))
+    c.chat_json("u", "m", "sys", "usr", think=False)
+    assert cap["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
 
 def test_client_cached_per_base_url(monkeypatch):
     calls = []

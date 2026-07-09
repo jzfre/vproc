@@ -8,8 +8,9 @@ def _cfg():
 def test_generate_parses_and_keeps_cited_claims():
     def fake_chat(base_url, model, system, user, **kwargs):
         assert "EVIDENCE" in user
-        # the runaway-thinking bound must reach the client call
+        # the runaway-thinking bound and the thinking switch must reach the client call
         assert kwargs["max_tokens"] == _cfg().grounding_max_tokens
+        assert kwargs["think"] == _cfg().grounding_thinking
         return '{"answered": true, "claims": [{"text": "ships in July", "evidence_ids": ["E1"]}]}'
     out = generate(_cfg(), "when does it ship?", "[E1] \"ships in July\"", chat=fake_chat)
     assert out["answered"] is True

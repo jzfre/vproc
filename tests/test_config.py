@@ -67,6 +67,17 @@ def test_frames_dir_default_and_override(monkeypatch):
     monkeypatch.setenv("VPROC_FRAMES_DIR", "/data/frames")
     assert load_config().frames_dir == "/data/frames"
 
+def test_grounding_thinking_default_and_off(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("VPROC_"):
+            monkeypatch.delenv(k, raising=False)
+    assert load_config().grounding_thinking is True
+    for off in ("off", "false", "0", "no", "OFF"):
+        monkeypatch.setenv("VPROC_GROUNDING_THINKING", off)
+        assert load_config().grounding_thinking is False, off
+    monkeypatch.setenv("VPROC_GROUNDING_THINKING", "on")
+    assert load_config().grounding_thinking is True
+
 def test_defaults(monkeypatch):
     for k in list(__import__("os").environ):
         if k.startswith("VPROC_"):
