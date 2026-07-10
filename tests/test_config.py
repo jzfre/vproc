@@ -112,3 +112,13 @@ def test_env_overrides(monkeypatch):
     assert cfg.grounding.base_url == "http://x:9/v1"
     assert cfg.grounding.model == "my-model"
     assert cfg.port == 9000
+
+def test_diarize_model_default_and_disable(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("VPROC_"):
+            monkeypatch.delenv(k, raising=False)
+    assert load_config().diarize_model == "pyannote/speaker-diarization-community-1"
+    monkeypatch.setenv("VPROC_DIARIZE_MODEL", "")   # empty string disables diarization
+    assert load_config().diarize_model == ""
+    monkeypatch.setenv("VPROC_DIARIZE_MODEL", "pyannote/speaker-diarization-3.1")
+    assert load_config().diarize_model == "pyannote/speaker-diarization-3.1"
