@@ -263,4 +263,6 @@ def test_diarization_failure_degrades_to_unlabeled(tmp_path, monkeypatch, capsys
     n = P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
     assert n >= 1
     assert all(r["speaker"] == "SPEAKER_0" for r in store.rows)  # transcript survives unlabeled
-    assert "diarization failed" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "diarization failed" in err
+    assert "pyannote/fake" in err  # model named for diagnosability

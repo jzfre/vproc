@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 from vproc.ingest.transcribe import TranscriptSegment
@@ -16,6 +17,8 @@ def _load_pipeline(cfg):
 
     pipe = Pipeline.from_pretrained(cfg.diarize_model, token=cfg.hf_token)
     if torch.backends.mps.is_available():
+        # Unsupported MPS ops fall back to CPU instead of aborting diarization entirely.
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         pipe.to(torch.device("mps"))
     return pipe
 
@@ -44,7 +47,7 @@ def assign_speakers(transcript: list[TranscriptSegment], turns: list[SpeakerTurn
             ov = min(seg.end, t.end) - max(seg.start, t.start)
             if ov > 0:
                 overlap[t.speaker] = overlap.get(t.speaker, 0.0) + ov
-                earliest[t.speaker] = min(earliest.get(t.speaker, t.start), t.start)
+                earliest[t.speaker] = min(earliest.get(t.speaker, float("inf")), t.start)
         if overlap:
             seg.speaker = max(overlap, key=lambda s: (overlap[s], -earliest[s]))
         else:

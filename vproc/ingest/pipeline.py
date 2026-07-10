@@ -63,7 +63,7 @@ def ingest_video(video_path: str, cfg=None, store=None, project_id: str = "defau
                 D.assign_speakers(transcript, D.diarize(wav_path, cfg))
             except Exception as e:
                 # Best-effort like OCR: speaker labels are never worth losing the transcript.
-                print(f"warning: diarization failed: {e}", file=sys.stderr)
+                print(f"warning: diarization failed ({cfg.diarize_model}): {e}", file=sys.stderr)
 
         end_time = max(kept[-1].t if kept else 0.0, transcript[-1].end if transcript else 0.0)
         states = A.build_screen_states(kept, end_time)
