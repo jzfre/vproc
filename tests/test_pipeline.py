@@ -37,6 +37,7 @@ def _cfg(tmp_path):
         frames_dir=str(tmp_path / "frames"),
         ocr_timeout=60.0,
         ocr_max_tokens=1024,
+        diarize_model="",
     )
 
 
@@ -223,3 +224,45 @@ def test_add_before_delete_carries_new_row_ids(tmp_path, monkeypatch):
     assert memory_id == "standup" and project_id == "default"
     assert set(keep_ids) == {r["id"] for r in store.rows}
     assert len(keep_ids) == 2  # exactly the two new rows, nothing extra kept
+
+
+def test_diarization_labels_reach_store(tmp_path, monkeypatch):
+    from vproc.ingest.diarize import SpeakerTurn
+    _patch(monkeypatch, tmp_path,
+           transcript=[TranscriptSegment(0.0, 4.0, "hello there"),
+                       TranscriptSegment(4.0, 9.0, "hi back")])
+    monkeypatch.setattr(P.D, "diarize",
+                        lambda wav, cfg: [SpeakerTurn(0.0, 4.0, "SPEAKER_00"),
+                                          SpeakerTurn(4.0, 9.0, "SPEAKER_01")])
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "pyannote/fake"
+    store = FakeStore()
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    speakers = {r["speaker"] for r in store.rows}
+    assert {"SPEAKER_00", "SPEAKER_01"} <= speakers  # align sub-splits on speaker change
+
+
+def test_diarization_disabled_when_model_empty(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path)
+    def _boom(wav, cfg):
+        raise AssertionError("diarize must not be called when disabled")
+    monkeypatch.setattr(P.D, "diarize", _boom)
+    store = FakeStore()
+    n = P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=store)
+    assert n >= 1  # ingest proceeded, diarize never invoked
+
+
+def test_diarization_failure_degrades_to_unlabeled(tmp_path, monkeypatch, capsys):
+    _patch(monkeypatch, tmp_path)
+    def _boom(wav, cfg):
+        raise RuntimeError("bad token")
+    monkeypatch.setattr(P.D, "diarize", _boom)
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "pyannote/fake"
+    store = FakeStore()
+    n = P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    assert n >= 1
+    assert all(r["speaker"] == "SPEAKER_0" for r in store.rows)  # transcript survives unlabeled
+    err = capsys.readouterr().err
+    assert "diarization failed" in err
+    assert "pyannote/fake" in err  # model named for diagnosability

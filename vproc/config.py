@@ -3,6 +3,7 @@ import pathlib
 from dataclasses import dataclass
 
 DEFAULT_HHEM_MODEL = "vectara/hallucination_evaluation_model"
+DEFAULT_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -60,6 +61,8 @@ class Config:
     # Thinking ON = better answers, ~60-90s/question on a reasoning model; OFF = seconds,
     # but measurably worse grounding (an answerable question flipped to abstention in A/B).
     grounding_thinking: bool = True
+    # Speaker diarization pipeline (HF-gated; uses hf_token). Empty string = disabled.
+    diarize_model: str = DEFAULT_DIARIZE_MODEL
 
 
 def _ep(prefix: str, default_url: str, default_model: str) -> Endpoint:
@@ -88,4 +91,5 @@ def load_config() -> Config:
         grounding_max_tokens=int(os.environ.get("VPROC_GROUNDING_MAX_TOKENS", "8192")),
         grounding_thinking=os.environ.get("VPROC_GROUNDING_THINKING", "on").strip().lower()
         not in ("0", "false", "off", "no"),
+        diarize_model=os.environ.get("VPROC_DIARIZE_MODEL", DEFAULT_DIARIZE_MODEL),
     )
