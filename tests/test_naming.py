@@ -62,3 +62,58 @@ def test_apply_names_relabels_only_mapped():
          TranscriptSegment(1.0, 2.0, "b", speaker="SPEAKER_01")]
     apply_names(t, {"SPEAKER_00": "Repan, Jozef"})
     assert [s.speaker for s in t] == ["Repan, Jozef", "SPEAKER_01"]
+
+
+import json
+import os
+
+import vproc.ingest.naming as N
+from vproc.ingest.diarize import SpeakerTurn
+
+
+def test_parse_vote_lenient():
+    assert N._parse_vote('{"speaking": "A B", "visible_names": ["A B", "C D"]}') == ("A B", ["A B", "C D"])
+    assert N._parse_vote('noise before {"speaking": null, "visible_names": []} after') == (None, [])
+    assert N._parse_vote('{"speaking": "  ", "visible_names": "not-a-list"}') == (None, [])
+    assert N._parse_vote("total garbage") == (None, [])
+
+
+def test_sample_name_votes_probes_longest_turns(monkeypatch):
+    monkeypatch.setattr(N, "_frame_at", lambda video, t, out: None)  # no real ffmpeg
+    probed = []
+    def probe(path):
+        probed.append(path)
+        return '{"speaking": "Repan, Jozef", "visible_names": ["Repan, Jozef"]}'
+    # 8 turns for one speaker: only the 6 longest get probed; 1 turn for another.
+    turns = [SpeakerTurn(i * 10.0, i * 10.0 + 1.0 + i, "SPEAKER_00") for i in range(8)]
+    turns.append(SpeakerTurn(500.0, 520.0, "SPEAKER_01"))
+    votes = N.sample_name_votes("/v.mkv", turns, cfg=None, probe=probe)
+    assert len([v for v in votes if v.speaker == "SPEAKER_00"]) == 6
+    assert len([v for v in votes if v.speaker == "SPEAKER_01"]) == 1
+    assert all(v.name == "Repan, Jozef" for v in votes)
+    # longest turns won: the two shortest SPEAKER_00 turns (i=0,1) were skipped
+    probed_ts = {v.t for v in votes if v.speaker == "SPEAKER_00"}
+    assert (0.0 + 1.0) / 2 not in probed_ts and (10.0 + 12.0) / 2 not in probed_ts
+
+
+def test_sample_name_votes_skips_failed_probes(monkeypatch):
+    monkeypatch.setattr(N, "_frame_at", lambda video, t, out: None)
+    calls = {"n": 0}
+    def probe(path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("slow")
+        return '{"speaking": "X Y", "visible_names": []}'
+    turns = [SpeakerTurn(0.0, 10.0, "SPEAKER_00"), SpeakerTurn(20.0, 30.0, "SPEAKER_00")]
+    votes = N.sample_name_votes("/v.mkv", turns, cfg=None, probe=probe)
+    assert len(votes) == 1  # first probe lost, ingest-level behavior unaffected
+
+
+def test_speaker_map_round_trip(tmp_path):
+    data = {"mapping": {"SPEAKER_04": "Repan, Jozef"},
+            "suggestions": {"SPEAKER_02": {"votes": {"A": 1}, "evidence": []}},
+            "votes": [{"speaker": "SPEAKER_04", "t": 889, "name": "Repan, Jozef"}]}
+    mem_dir = str(tmp_path / "frames" / "default" / "test")
+    N.save_speaker_map(mem_dir, data)
+    assert N.load_speaker_map(mem_dir) == data
+    assert os.path.exists(os.path.join(mem_dir, "speakers.json"))

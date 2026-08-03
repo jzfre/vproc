@@ -80,3 +80,60 @@ def apply_names(transcript: list[TranscriptSegment], mapping: dict[str, str]) ->
     for seg in transcript:
         if seg.speaker in mapping:
             seg.speaker = mapping[seg.speaker]
+
+
+def _frame_at(video_path: str, t: float, out_path: str) -> None:
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+         "-ss", str(t), "-i", video_path, "-frames:v", "1", out_path, "-y"],
+        check=True)
+
+
+def _parse_vote(raw: str) -> tuple[str | None, list[str]]:
+    """Lenient parse of a probe reply; a malformed reply is a lost vote, not an error."""
+    try:
+        i, j = raw.find("{"), raw.rfind("}")
+        data = json.loads(raw[i:j + 1])
+        name = data.get("speaking")
+        names = data.get("visible_names")
+        return (name if isinstance(name, str) and name.strip() else None,
+                [n for n in names if isinstance(n, str)] if isinstance(names, list) else [])
+    except Exception:
+        return None, []
+
+
+def sample_name_votes(video_path: str, turns: list[SpeakerTurn], cfg, probe=None) -> list[NameVote]:
+    """Probe frames at the midpoints of each cluster's longest turns and ask the vision
+    model who is speaking. `probe` is the injection seam: (image_path) -> raw reply."""
+    if probe is None:
+        def probe(path):
+            return client.ocr_image(cfg.ocr.base_url, cfg.ocr.model, path, PROMPT,
+                                    timeout=cfg.ocr_timeout, max_tokens=cfg.ocr_max_tokens)
+    by_speaker: dict[str, list[SpeakerTurn]] = defaultdict(list)
+    for t in turns:
+        by_speaker[t.speaker].append(t)
+    votes: list[NameVote] = []
+    with tempfile.TemporaryDirectory(prefix="vproc-name-") as work:
+        for speaker, spk_turns in sorted(by_speaker.items()):
+            longest = sorted(spk_turns, key=lambda t: t.end - t.start, reverse=True)
+            for turn in longest[:MAX_PROBES_PER_SPEAKER]:
+                mid = (turn.start + turn.end) / 2.0
+                frame = os.path.join(work, f"{speaker}-{int(mid * 1000)}.png")
+                try:
+                    _frame_at(video_path, mid, frame)
+                    name, visible = _parse_vote(probe(frame))
+                except Exception:
+                    continue  # a failed probe is a lost vote, never a failed ingest
+                votes.append(NameVote(speaker, mid, name, visible))
+    return votes
+
+
+def save_speaker_map(mem_dir: str, data: dict) -> None:
+    os.makedirs(mem_dir, exist_ok=True)
+    with open(os.path.join(mem_dir, "speakers.json"), "w") as f:
+        json.dump(data, f, indent=1)
+
+
+def load_speaker_map(mem_dir: str) -> dict:
+    with open(os.path.join(mem_dir, "speakers.json")) as f:
+        return json.load(f)
