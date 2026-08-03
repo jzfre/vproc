@@ -63,6 +63,8 @@ class Config:
     grounding_thinking: bool = True
     # Speaker diarization pipeline (HF-gated; uses hf_token). Empty string = disabled.
     diarize_model: str = DEFAULT_DIARIZE_MODEL
+    # Nameplate speaker naming (needs diarization + the vision endpoint). Off = keep SPEAKER_xx.
+    speaker_naming: bool = True
 
 
 def _ep(prefix: str, default_url: str, default_model: str) -> Endpoint:
@@ -92,4 +94,6 @@ def load_config() -> Config:
         grounding_thinking=os.environ.get("VPROC_GROUNDING_THINKING", "on").strip().lower()
         not in ("0", "false", "off", "no"),
         diarize_model=os.environ.get("VPROC_DIARIZE_MODEL", DEFAULT_DIARIZE_MODEL),
+        speaker_naming=os.environ.get("VPROC_SPEAKER_NAMING", "on").strip().lower()
+        not in ("0", "false", "off", "no"),
     )
