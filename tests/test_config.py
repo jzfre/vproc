@@ -122,3 +122,14 @@ def test_diarize_model_default_and_disable(monkeypatch):
     assert load_config().diarize_model == ""
     monkeypatch.setenv("VPROC_DIARIZE_MODEL", "pyannote/speaker-diarization-3.1")
     assert load_config().diarize_model == "pyannote/speaker-diarization-3.1"
+
+def test_speaker_naming_default_and_off(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("VPROC_"):
+            monkeypatch.delenv(k, raising=False)
+    assert load_config().speaker_naming is True
+    for off in ("off", "false", "0", "no", "OFF"):
+        monkeypatch.setenv("VPROC_SPEAKER_NAMING", off)
+        assert load_config().speaker_naming is False, off
+    monkeypatch.setenv("VPROC_SPEAKER_NAMING", "on")
+    assert load_config().speaker_naming is True

@@ -55,6 +55,27 @@ class Store:
             cond += f" AND id NOT IN ({kept})"
         table.delete(cond)
 
+    def update_speaker(self, memory_id: str, project_id: str | None,
+                       old_speaker: str, new_speaker: str) -> int:
+        """Manual speaker rename (vproc speakers --set). embed_text keeps the old label
+        string by design — retrieval is unaffected; no re-embed. Returns rows updated so
+        the CLI can tell a real rename from a no-op typo."""
+        table = self._table()
+        if table is None:
+            return 0
+        safe = memory_id.replace("'", "''")  # escape for the SQL-style filter
+        safe_speaker = old_speaker.replace("'", "''")
+        where = f"memory_id = '{safe}' AND speaker = '{safe_speaker}'"
+        if project_id is not None:
+            safe_proj = project_id.replace("'", "''")
+            where += f" AND project_id = '{safe_proj}'"
+        # Pre-query so a lancedb without UpdateResult.rows_updated can still report a count —
+        # querying by old_speaker after the update would find nothing (already renamed).
+        pending = len(table.search().where(where, prefilter=True).to_list())
+        result = table.update(where=where, values={"speaker": new_speaker})
+        rows_updated = getattr(result, "rows_updated", None)
+        return rows_updated if rows_updated is not None else pending
+
     def vector_search(self, vector, k: int, where: str | None = None) -> list[dict]:
         table = self._table()
         if table is None:

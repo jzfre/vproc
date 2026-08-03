@@ -10,6 +10,7 @@ from vproc.ingest import align as A
 from vproc.ingest import diarize as D
 from vproc.ingest import embed_index as EI
 from vproc.ingest import frames as F
+from vproc.ingest import naming as N
 from vproc.ingest import ocr as O
 from vproc.ingest import transcribe as T
 from vproc.store.lancedb_store import Store
@@ -58,9 +59,28 @@ def ingest_video(video_path: str, cfg=None, store=None, project_id: str = "defau
         else:
             transcript = []  # no audio track: OCR-only ingest
 
+        speaker_map = None
         if transcript and cfg.diarize_model:
             try:
-                D.assign_speakers(transcript, D.diarize(wav_path, cfg))
+                turns = D.diarize(wav_path, cfg)
+                D.assign_speakers(transcript, turns)
+                if cfg.speaker_naming and turns:
+                    try:
+                        votes = N.sample_name_votes(video_path, turns, cfg)
+                        mapping, suggestions = N.resolve_names(votes)
+                        N.apply_names(transcript, mapping)
+                        speaker_map = {
+                            "mapping": mapping, "suggestions": suggestions,
+                            "votes": [{"speaker": v.speaker, "t": round(v.t), "name": v.name}
+                                      for v in votes],
+                        }
+                        for spk, name in sorted(mapping.items()):
+                            print(f"named: {spk} -> {name}")
+                        for spk in sorted(suggestions):
+                            print(f"unresolved speaker: {spk} (review with 'vproc speakers {title}')")
+                    except Exception as e:
+                        # Naming must never undo diarization labels or block the ingest.
+                        print(f"warning: speaker naming failed: {e}", file=sys.stderr)
             except Exception as e:
                 # Best-effort like OCR: speaker labels are never worth losing the transcript.
                 print(f"warning: diarization failed ({cfg.diarize_model}): {e}", file=sys.stderr)
@@ -105,6 +125,13 @@ def ingest_video(video_path: str, cfg=None, store=None, project_id: str = "defau
             shutil.move(src, dest)
         store.add(rows)
         store.delete_memory(title, project_id, keep_ids=[r["id"] for r in rows])
+        if speaker_map is not None:
+            try:
+                N.save_speaker_map(mem_dir, speaker_map)
+            except Exception as e:
+                # The sidecar is a convenience for `vproc speakers`; it must never
+                # abort an otherwise-successful ingest.
+                print(f"warning: failed to write speakers.json: {e}", file=sys.stderr)
         return len(segments)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

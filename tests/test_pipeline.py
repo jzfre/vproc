@@ -38,6 +38,7 @@ def _cfg(tmp_path):
         ocr_timeout=60.0,
         ocr_max_tokens=1024,
         diarize_model="",
+        speaker_naming=False,
     )
 
 
@@ -266,3 +267,85 @@ def test_diarization_failure_degrades_to_unlabeled(tmp_path, monkeypatch, capsys
     err = capsys.readouterr().err
     assert "diarization failed" in err
     assert "pyannote/fake" in err  # model named for diagnosability
+
+
+def test_speaker_naming_applies_names_to_store(tmp_path, monkeypatch):
+    from vproc.ingest.diarize import SpeakerTurn
+    _patch(monkeypatch, tmp_path,
+           transcript=[TranscriptSegment(0.0, 4.0, "hello there"),
+                       TranscriptSegment(4.0, 9.0, "hi back")])
+    monkeypatch.setattr(P.D, "diarize",
+                        lambda wav, cfg: [SpeakerTurn(0.0, 4.0, "SPEAKER_00"),
+                                          SpeakerTurn(4.0, 9.0, "SPEAKER_01")])
+    monkeypatch.setattr(P.N, "sample_name_votes", lambda video, turns, cfg: [])
+    monkeypatch.setattr(P.N, "resolve_names",
+                        lambda votes: ({"SPEAKER_00": "Repan, Jozef"},
+                                       {"SPEAKER_01": {"votes": {}, "evidence": []}}))
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "pyannote/fake"
+    cfg.speaker_naming = True
+    store = FakeStore()
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    speakers = {r["speaker"] for r in store.rows}
+    assert "Repan, Jozef" in speakers and "SPEAKER_01" in speakers
+    import json as _json
+    m = _json.load(open(os.path.join(cfg.frames_dir, "default", "standup", "speakers.json")))
+    assert m["mapping"] == {"SPEAKER_00": "Repan, Jozef"}
+    assert "SPEAKER_01" in m["suggestions"]
+
+
+def test_naming_failure_keeps_diarized_labels(tmp_path, monkeypatch, capsys):
+    from vproc.ingest.diarize import SpeakerTurn
+    _patch(monkeypatch, tmp_path,
+           transcript=[TranscriptSegment(0.0, 4.0, "hello"), TranscriptSegment(4.0, 9.0, "hi")])
+    monkeypatch.setattr(P.D, "diarize",
+                        lambda wav, cfg: [SpeakerTurn(0.0, 4.0, "SPEAKER_00"),
+                                          SpeakerTurn(4.0, 9.0, "SPEAKER_01")])
+    def boom(video, turns, cfg):
+        raise RuntimeError("vision endpoint down")
+    monkeypatch.setattr(P.N, "sample_name_votes", boom)
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "pyannote/fake"
+    cfg.speaker_naming = True
+    store = FakeStore()
+    n = P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    assert n >= 1
+    assert {r["speaker"] for r in store.rows} >= {"SPEAKER_00", "SPEAKER_01"}  # labels survive
+    assert "speaker naming failed" in capsys.readouterr().err
+
+
+def test_speaker_map_write_failure_does_not_abort_ingest(tmp_path, monkeypatch, capsys):
+    from vproc.ingest.diarize import SpeakerTurn
+    _patch(monkeypatch, tmp_path,
+           transcript=[TranscriptSegment(0.0, 4.0, "hello there"),
+                       TranscriptSegment(4.0, 9.0, "hi back")])
+    monkeypatch.setattr(P.D, "diarize",
+                        lambda wav, cfg: [SpeakerTurn(0.0, 4.0, "SPEAKER_00"),
+                                          SpeakerTurn(4.0, 9.0, "SPEAKER_01")])
+    monkeypatch.setattr(P.N, "sample_name_votes", lambda video, turns, cfg: [])
+    monkeypatch.setattr(P.N, "resolve_names",
+                        lambda votes: ({"SPEAKER_00": "Repan, Jozef"}, {}))
+    def boom(mem_dir, data):
+        raise OSError("disk full")
+    monkeypatch.setattr(P.N, "save_speaker_map", boom)
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "pyannote/fake"
+    cfg.speaker_naming = True
+    store = FakeStore()
+    n = P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    assert n >= 1  # the sidecar write failed, but the ingest still succeeded
+    assert "Repan, Jozef" in {r["speaker"] for r in store.rows}  # store already has the rows
+    assert "warning: failed to write speakers.json" in capsys.readouterr().err
+
+
+def test_naming_disabled_skips_probes(tmp_path, monkeypatch):
+    from vproc.ingest.diarize import SpeakerTurn
+    _patch(monkeypatch, tmp_path)
+    monkeypatch.setattr(P.D, "diarize", lambda wav, cfg: [SpeakerTurn(0.0, 3.0, "SPEAKER_00")])
+    def boom(video, turns, cfg):
+        raise AssertionError("must not probe when speaker_naming is off")
+    monkeypatch.setattr(P.N, "sample_name_votes", boom)
+    cfg = _cfg(tmp_path)          # speaker_naming=False by default
+    cfg.diarize_model = "pyannote/fake"
+    store = FakeStore()
+    assert P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store) >= 1
