@@ -314,6 +314,30 @@ def test_naming_failure_keeps_diarized_labels(tmp_path, monkeypatch, capsys):
     assert "speaker naming failed" in capsys.readouterr().err
 
 
+def test_speaker_map_write_failure_does_not_abort_ingest(tmp_path, monkeypatch, capsys):
+    from vproc.ingest.diarize import SpeakerTurn
+    _patch(monkeypatch, tmp_path,
+           transcript=[TranscriptSegment(0.0, 4.0, "hello there"),
+                       TranscriptSegment(4.0, 9.0, "hi back")])
+    monkeypatch.setattr(P.D, "diarize",
+                        lambda wav, cfg: [SpeakerTurn(0.0, 4.0, "SPEAKER_00"),
+                                          SpeakerTurn(4.0, 9.0, "SPEAKER_01")])
+    monkeypatch.setattr(P.N, "sample_name_votes", lambda video, turns, cfg: [])
+    monkeypatch.setattr(P.N, "resolve_names",
+                        lambda votes: ({"SPEAKER_00": "Repan, Jozef"}, {}))
+    def boom(mem_dir, data):
+        raise OSError("disk full")
+    monkeypatch.setattr(P.N, "save_speaker_map", boom)
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "pyannote/fake"
+    cfg.speaker_naming = True
+    store = FakeStore()
+    n = P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    assert n >= 1  # the sidecar write failed, but the ingest still succeeded
+    assert "Repan, Jozef" in {r["speaker"] for r in store.rows}  # store already has the rows
+    assert "warning: failed to write speakers.json" in capsys.readouterr().err
+
+
 def test_naming_disabled_skips_probes(tmp_path, monkeypatch):
     from vproc.ingest.diarize import SpeakerTurn
     _patch(monkeypatch, tmp_path)

@@ -10,6 +10,8 @@
 *.lance/
 *.sqlite
 *.sqlite3
+speakers.json
+vproc_frames*/
 
 # Secrets / environment
 .env

@@ -19,6 +19,27 @@ def test_canonicalization_groups_ocr_jitter():
     assert suggestions == {}
 
 
+def test_cooccurring_similar_names_stay_distinct():
+    # One frame's visible_names lists both spellings together: they are confirmed to be
+    # two different people despite passing the 0.75 similarity threshold (0.966 ratio).
+    votes = [
+        _v("SPEAKER_00", "Patino, Daniel", visible=["Patino, Daniel", "Patino, Daniela"]),
+        _v("SPEAKER_00", "Patino, Daniel"),
+        _v("SPEAKER_01", "Patino, Daniela"),
+        _v("SPEAKER_01", "Patino, Daniela"),
+    ]
+    mapping, _ = resolve_names(votes)
+    assert mapping == {"SPEAKER_00": "Patino, Daniel", "SPEAKER_01": "Patino, Daniela"}
+
+
+def test_jitter_without_cooccurrence_still_groups():
+    # Control: same kind of near-miss similarity, but the spellings never co-occur in a
+    # single frame, so jitter-merging still collapses them into one canonical name.
+    votes = [_v("SPEAKER_00", "Vanco, Pavol"), _v("SPEAKER_00", "Yanco, Pavol")]
+    mapping, _ = resolve_names(votes)
+    assert mapping == {"SPEAKER_00": "Vanco, Pavol"}
+
+
 def test_distinct_names_do_not_merge():
     votes = [_v("SPEAKER_00", "Repan, Jozef"), _v("SPEAKER_00", "PATINO, DANIEL"),
              _v("SPEAKER_00", "Repan, Jozef")]
@@ -64,7 +85,6 @@ def test_apply_names_relabels_only_mapped():
     assert [s.speaker for s in t] == ["Repan, Jozef", "SPEAKER_01"]
 
 
-import json
 import os
 
 import vproc.ingest.naming as N
@@ -96,7 +116,7 @@ def test_sample_name_votes_probes_longest_turns(monkeypatch):
     assert (0.0 + 1.0) / 2 not in probed_ts and (10.0 + 12.0) / 2 not in probed_ts
 
 
-def test_sample_name_votes_skips_failed_probes(monkeypatch):
+def test_sample_name_votes_skips_failed_probes(monkeypatch, capsys):
     monkeypatch.setattr(N, "_frame_at", lambda video, t, out: None)
     calls = {"n": 0}
     def probe(path):
@@ -107,6 +127,17 @@ def test_sample_name_votes_skips_failed_probes(monkeypatch):
     turns = [SpeakerTurn(0.0, 10.0, "SPEAKER_00"), SpeakerTurn(20.0, 30.0, "SPEAKER_00")]
     votes = N.sample_name_votes("/v.mkv", turns, cfg=None, probe=probe)
     assert len(votes) == 1  # first probe lost, ingest-level behavior unaffected
+    assert "warning: 1/2 name probes failed" in capsys.readouterr().err
+
+
+def test_sample_name_votes_all_failed_warns_once(monkeypatch, capsys):
+    monkeypatch.setattr(N, "_frame_at", lambda video, t, out: None)
+    def probe(path):
+        raise TimeoutError("slow")
+    turns = [SpeakerTurn(0.0, 10.0, "SPEAKER_00"), SpeakerTurn(20.0, 30.0, "SPEAKER_00")]
+    votes = N.sample_name_votes("/v.mkv", turns, cfg=None, probe=probe)
+    assert votes == []
+    assert "warning: 2/2 name probes failed" in capsys.readouterr().err
 
 
 def test_speaker_map_round_trip(tmp_path):

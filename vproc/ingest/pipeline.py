@@ -123,10 +123,15 @@ def ingest_video(video_path: str, cfg=None, store=None, project_id: str = "defau
         os.makedirs(mem_dir, exist_ok=True)
         for src, dest in moves.items():
             shutil.move(src, dest)
-        if speaker_map is not None:
-            N.save_speaker_map(mem_dir, speaker_map)
         store.add(rows)
         store.delete_memory(title, project_id, keep_ids=[r["id"] for r in rows])
+        if speaker_map is not None:
+            try:
+                N.save_speaker_map(mem_dir, speaker_map)
+            except Exception as e:
+                # The sidecar is a convenience for `vproc speakers`; it must never
+                # abort an otherwise-successful ingest.
+                print(f"warning: failed to write speakers.json: {e}", file=sys.stderr)
         return len(segments)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

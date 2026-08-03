@@ -16,19 +16,27 @@ def _speakers(args: list[str]) -> None:
     cfg = load_config()
     memory = args[0]
     mem_dir = os.path.join(cfg.frames_dir, "default", memory)
+    is_set = len(args) >= 3 and args[1] == "--set"
     try:
         m = N.load_speaker_map(mem_dir)
     except FileNotFoundError:
-        print(f"no speaker map for '{memory}' (expected {mem_dir}/speakers.json)")
-        return
-    if len(args) >= 3 and args[1] == "--set" and "=" in args[2]:
+        if not is_set:
+            print(f"no speaker map for '{memory}' (expected {mem_dir}/speakers.json)")
+            return
+        m = {"mapping": {}, "suggestions": {}, "votes": []}  # bootstrap: --set works cold
+    if is_set:
         old, _, new = args[2].partition("=")
         old, new = old.strip(), new.strip()
-        _store_for(cfg).update_speaker(memory, "default", old, new)
+        if not old or not new:
+            print("usage: vproc speakers <memory> --set 'SPEAKER_XX=Name'")
+            sys.exit(1)
+        n = _store_for(cfg).update_speaker(memory, "default", old, new)
         m["mapping"][old] = new
         m["suggestions"].pop(old, None)
         N.save_speaker_map(mem_dir, m)
-        print(f"renamed {old} -> {new} in '{memory}'")
+        print(f"renamed {old} -> {new} in '{memory}' ({n} rows)")
+        if n == 0:
+            print(f"warning: no rows matched {old}", file=sys.stderr)
         return
     for spk, name in sorted(m.get("mapping", {}).items()):
         print(f"{spk} = {name}")

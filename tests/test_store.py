@@ -113,6 +113,11 @@ def test_delete_memory_empty_keep_ids_deletes_all(tmp_path):
     store.delete_memory("m1", keep_ids=[])  # empty behaves as today: delete all
     assert store.vector_search([1.0, 0.0], k=5) == []
 
+def test_update_speaker_on_empty_store_returns_zero(tmp_path):
+    store = Store(str(tmp_path / "db.lance"))
+    assert store.update_speaker("m1", "default", "SPEAKER_00", "X") == 0  # no table yet, no raise
+
+
 def test_update_speaker_renames_only_matching_rows(tmp_path):
     store = Store(str(tmp_path / "db"))
     store.add([
@@ -126,6 +131,8 @@ def test_update_speaker_renames_only_matching_rows(tmp_path):
          "start_ts": 0.0, "end_ts": 1.0, "said_text": "z", "on_screen_text": "",
          "embed_text": "z", "source_video": "v", "frame_path": "", "vector": [1.0, 1.0]},
     ])
-    store.update_speaker("m1", "default", "SPEAKER_02", "PATINO, DANIEL")
+    n = store.update_speaker("m1", "default", "SPEAKER_02", "PATINO, DANIEL")
+    assert n == 1  # only row "a" matched (memory_id + speaker + project_id)
     rows = {r["id"]: r["speaker"] for r in store._table().to_arrow().to_pylist()}
     assert rows == {"a": "PATINO, DANIEL", "b": "SPEAKER_01", "c": "SPEAKER_02"}
+    assert store.update_speaker("m1", "default", "SPEAKER_02", "X") == 0  # no longer present

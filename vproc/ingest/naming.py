@@ -1,10 +1,12 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from itertools import combinations
 
 from vproc.ingest.diarize import SpeakerTurn
 from vproc.ingest.transcribe import TranscriptSegment
@@ -30,13 +32,18 @@ class NameVote:
     visible_names: list[str]
 
 
-def _canonicalize(all_names: list[str]) -> dict[str, str]:
-    """Map each OCR spelling variant to its group's most frequent form."""
+def _canonicalize(all_names: list[str],
+                  cooccur: set[frozenset[str]] = frozenset()) -> dict[str, str]:
+    """Map each OCR spelling variant to its group's most frequent form. Two spellings that
+    co-occurred in one frame's visible_names are confirmed distinct people and never share
+    a group, however similar (e.g. "Patino, Daniel" vs "Patino, Daniela")."""
     counts = Counter(n.strip() for n in all_names if n and n.strip())
     groups: list[list[str]] = []
     for name in sorted(counts, key=lambda n: -counts[n]):
         for g in groups:
-            if SequenceMatcher(None, name.lower(), g[0].lower()).ratio() >= SIMILARITY:
+            similar = SequenceMatcher(None, name.lower(), g[0].lower()).ratio() >= SIMILARITY
+            conflicts = any(frozenset((name, m)) in cooccur for m in g)
+            if similar and not conflicts:
                 g.append(name)
                 break
         else:
@@ -54,7 +61,11 @@ def resolve_names(votes: list[NameVote]) -> tuple[dict[str, str], dict]:
     >= 2 votes AND a strict majority of the cluster's non-null votes; clusters sharing a
     winner both map (diarization over-splits). The rest become evidence-backed suggestions."""
     all_names = [v.name for v in votes if v.name] + [n for v in votes for n in v.visible_names]
-    canon = _canonicalize(all_names)
+    cooccur = {frozenset((a.strip(), b.strip()))
+              for v in votes
+              for a, b in combinations(v.visible_names, 2)
+              if a.strip() and b.strip() and a.strip() != b.strip()}
+    canon = _canonicalize(all_names, cooccur)
     by_speaker: dict[str, list[NameVote]] = defaultdict(list)
     for v in votes:
         by_speaker[v.speaker].append(v)
@@ -113,18 +124,23 @@ def sample_name_votes(video_path: str, turns: list[SpeakerTurn], cfg, probe=None
     for t in turns:
         by_speaker[t.speaker].append(t)
     votes: list[NameVote] = []
+    attempted = failed = 0
     with tempfile.TemporaryDirectory(prefix="vproc-name-") as work:
         for speaker, spk_turns in sorted(by_speaker.items()):
             longest = sorted(spk_turns, key=lambda t: t.end - t.start, reverse=True)
             for turn in longest[:MAX_PROBES_PER_SPEAKER]:
                 mid = (turn.start + turn.end) / 2.0
                 frame = os.path.join(work, f"{speaker}-{int(mid * 1000)}.png")
+                attempted += 1
                 try:
                     _frame_at(video_path, mid, frame)
                     name, visible = _parse_vote(probe(frame))
                 except Exception:
+                    failed += 1
                     continue  # a failed probe is a lost vote, never a failed ingest
                 votes.append(NameVote(speaker, mid, name, visible))
+    if failed:
+        print(f"warning: {failed}/{attempted} name probes failed", file=sys.stderr)
     return votes
 
 
