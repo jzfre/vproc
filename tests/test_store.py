@@ -136,3 +136,20 @@ def test_update_speaker_renames_only_matching_rows(tmp_path):
     rows = {r["id"]: r["speaker"] for r in store._table().to_arrow().to_pylist()}
     assert rows == {"a": "PATINO, DANIEL", "b": "SPEAKER_01", "c": "SPEAKER_02"}
     assert store.update_speaker("m1", "default", "SPEAKER_02", "X") == 0  # no longer present
+
+def test_memory_rows_filters_and_strips_vector(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.add([
+        {"id": "a", "memory_id": "m1", "project_id": "default", "speaker": "S1",
+         "start_ts": 5.0, "end_ts": 9.0, "said_text": "x", "on_screen_text": "",
+         "embed_text": "x", "source_video": "v.mp4", "frame_path": "", "vector": [1.0, 0.0]},
+        {"id": "b", "memory_id": "m2", "project_id": "default", "speaker": "S2",
+         "start_ts": 0.0, "end_ts": 1.0, "said_text": "y", "on_screen_text": "",
+         "embed_text": "y", "source_video": "w.mp4", "frame_path": "", "vector": [0.0, 1.0]},
+    ])
+    rows = store.memory_rows("m1", "default")
+    assert [r["id"] for r in rows] == ["a"]
+    assert "vector" not in rows[0]
+    assert store.memory_rows("m1", "other-project") == []
+    assert store.memory_rows("nope") == []
+    assert Store(str(tmp_path / "empty")).memory_rows("m1") == []  # no table yet

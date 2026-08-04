@@ -96,3 +96,14 @@ class Store:
             return q.to_list()
         except Exception:
             return []
+
+    def memory_rows(self, memory_id: str, project_id: str | None = None) -> list[dict]:
+        """All rows for a memory (no vector column). Full scan — fine at personal scale."""
+        table = self._table()
+        if table is None:
+            return []
+        rows = table.to_arrow().to_pylist()
+        return [{k: v for k, v in r.items() if k != "vector"}
+                for r in rows
+                if r["memory_id"] == memory_id
+                and (project_id is None or r["project_id"] == project_id)]
