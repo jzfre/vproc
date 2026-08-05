@@ -153,3 +153,13 @@ def test_memory_rows_filters_and_strips_vector(tmp_path):
     assert store.memory_rows("m1", "other-project") == []
     assert store.memory_rows("nope") == []
     assert Store(str(tmp_path / "empty")).memory_rows("m1") == []  # no table yet
+
+def test_all_rows_strips_vector(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.add([{"id": "a", "memory_id": "m1", "project_id": "default", "speaker": "S1",
+                "start_ts": 0.0, "end_ts": 1.0, "said_text": "x", "on_screen_text": "",
+                "embed_text": "x", "source_video": "v.mp4", "frame_path": "",
+                "vector": [1.0, 0.0]}])
+    rows = store.all_rows()
+    assert len(rows) == 1 and "vector" not in rows[0]
+    assert Store(str(tmp_path / "empty")).all_rows() == []

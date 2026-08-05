@@ -97,13 +97,16 @@ class Store:
         except Exception:
             return []
 
-    def memory_rows(self, memory_id: str, project_id: str | None = None) -> list[dict]:
-        """All rows for a memory (no vector column). Full scan — fine at personal scale."""
+    def all_rows(self) -> list[dict]:
+        """Every row minus the vector column. Full scan — fine at personal scale."""
         table = self._table()
         if table is None:
             return []
-        rows = table.to_arrow().to_pylist()
         return [{k: v for k, v in r.items() if k != "vector"}
-                for r in rows
+                for r in table.to_arrow().to_pylist()]
+
+    def memory_rows(self, memory_id: str, project_id: str | None = None) -> list[dict]:
+        """All rows for a memory (no vector column)."""
+        return [r for r in self.all_rows()
                 if r["memory_id"] == memory_id
                 and (project_id is None or r["project_id"] == project_id)]

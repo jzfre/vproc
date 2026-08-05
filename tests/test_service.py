@@ -102,3 +102,55 @@ def test_mcp_endpoint_initializes():
         r = client.post("/mcp", json=init, headers=headers)
     assert r.status_code == 200        # no 404, no 500 'Task group is not initialized'
     assert '"serverInfo"' in r.text and '"protocolVersion"' in r.text
+
+
+def _ui_rows():
+    return [
+        {"id": "1", "memory_id": "standup", "project_id": "default", "speaker": "Repan, Jozef",
+         "start_ts": 10.0, "end_ts": 20.0, "said_text": "hello", "on_screen_text": "",
+         "embed_text": "", "source_video": "tmp/standup.mkv", "frame_path": ""},
+        {"id": "2", "memory_id": "standup", "project_id": "default", "speaker": "Vanco, Pavol",
+         "start_ts": 0.0, "end_ts": 10.0, "said_text": "hi", "on_screen_text": "agenda",
+         "embed_text": "", "source_video": "tmp/standup.mkv",
+         "frame_path": "./vproc_frames/default/standup/00000001.png"},
+    ]
+
+
+class _UIStore:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def all_rows(self):
+        return list(self.rows)
+
+    def memory_rows(self, memory_id, project_id=None):
+        return [r for r in self.rows if r["memory_id"] == memory_id
+                and (project_id is None or r["project_id"] == project_id)]
+
+
+def test_api_memories_aggregates():
+    app = create_app(store=_UIStore(_ui_rows()), scorer=lambda p, h: 1.0, cfg=_cfg())
+    c = TestClient(app)
+    r = c.get("/api/memories")
+    assert r.status_code == 200
+    (m,) = r.json()
+    assert m["memory_id"] == "standup" and m["segment_count"] == 2
+    assert m["duration_s"] == 20.0
+    assert m["speakers"] == ["Repan, Jozef", "Vanco, Pavol"]
+
+
+def test_api_segments_ordered_with_frame_name():
+    app = create_app(store=_UIStore(_ui_rows()), scorer=lambda p, h: 1.0, cfg=_cfg())
+    c = TestClient(app)
+    segs = c.get("/api/memories/standup/segments").json()
+    assert [s["start_ts"] for s in segs] == [0.0, 10.0]  # ordered by start_ts
+    assert segs[0]["frame_name"] == "00000001.png"
+    assert segs[1]["frame_name"] is None
+    assert set(segs[0]) == {"start_ts", "end_ts", "speaker", "said_text",
+                            "on_screen_text", "frame_name"}
+
+
+def test_api_segments_unknown_memory_404():
+    app = create_app(store=_UIStore([]), scorer=lambda p, h: 1.0, cfg=_cfg())
+    r = TestClient(app).get("/api/memories/nope/segments")
+    assert r.status_code == 404 and "detail" in r.json()

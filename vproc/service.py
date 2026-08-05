@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -66,6 +68,35 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
             raise HTTPException(status_code=400, detail="query is required")
         evidence = search(store, cfg, query, where=build_where(q))
         return [e.model_dump() for e in evidence]
+
+    @app.get("/api/memories")
+    def api_memories():
+        by_mem: dict[str, list[dict]] = {}
+        for r in store.all_rows():
+            if r.get("project_id", "default") == "default":
+                by_mem.setdefault(r["memory_id"], []).append(r)
+        return [
+            {"memory_id": mid, "segment_count": len(rows),
+             "duration_s": max(r["end_ts"] for r in rows),
+             "speakers": sorted({r["speaker"] for r in rows})}
+            for mid, rows in sorted(by_mem.items())
+        ]
+
+    @app.get("/api/memories/{memory_id}/segments")
+    def api_segments(memory_id: str):
+        # _safe validates length/control-chars; its escaped return isn't used here —
+        # memory_rows filters in Python (no SQL), so escaping would break ids with quotes.
+        _safe(memory_id, "memory")
+        rows = store.memory_rows(memory_id, "default")
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"no memory '{memory_id}'")
+        rows.sort(key=lambda r: r["start_ts"])
+        return [
+            {"start_ts": r["start_ts"], "end_ts": r["end_ts"], "speaker": r["speaker"],
+             "said_text": r["said_text"], "on_screen_text": r["on_screen_text"],
+             "frame_name": os.path.basename(r["frame_path"]) if r.get("frame_path") else None}
+            for r in rows
+        ]
 
     if mcp_app is not None:
         app.mount("/mcp", mcp_app)
