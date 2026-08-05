@@ -1,1 +1,40 @@
-<!doctype html><title>vproc</title><p>vproc UI</p>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vproc</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="brand-led" aria-hidden="true"></span><span class="brand-word">vproc</span></div>
+  <select id="memory-picker" aria-label="Meeting"></select>
+  <span id="meeting-meta" class="meta"></span>
+</header>
+<main>
+  <section id="player-pane">
+    <div class="video-frame">
+      <video id="video" controls preload="metadata"></video>
+      <div id="video-fallback" hidden></div>
+    </div>
+    <div id="now-speaking" aria-live="polite"></div>
+    <div id="timeline"></div>
+  </section>
+  <section id="transcript" aria-label="Transcript"></section>
+</main>
+<footer id="qa-panel">
+  <div id="qa-controls">
+    <select id="qa-mode" aria-label="Mode">
+      <option value="ask">ask</option>
+      <option value="search">search</option>
+    </select>
+    <input id="qa-input" placeholder="Ask this meeting…" autocomplete="off">
+    <button id="qa-go" type="button">Go</button>
+    <span id="qa-spinner" hidden aria-hidden="true"></span>
+  </div>
+  <div id="qa-results"></div>
+</footer>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
