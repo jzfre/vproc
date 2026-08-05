@@ -237,7 +237,85 @@ main {
 #timeline {
   flex: 1;
   min-height: 10px;
+  display: flex;
+  flex-direction: column;
   border-top: 1px solid var(--border-soft);
+}
+
+.lanes {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: safe center;
+  gap: 4px;
+  padding: 6px 4px;
+}
+
+.tl-empty {
+  margin: 0;
+  padding: 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+}
+
+.lane {
+  display: flex;
+  align-items: center;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.lane-label {
+  --c: var(--text-dim);
+  width: 92px;
+  flex-shrink: 0;
+  padding-right: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-align: right;
+  color: var(--c);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lane-track {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  background: var(--bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.turn {
+  --c: var(--text-dim);
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  background: var(--c);
+  border-radius: 2px;
+  opacity: 0.85;
+}
+
+.turn:hover { opacity: 1; }
+
+#playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--text-hi);
+  box-shadow: 0 0 4px 1px rgba(233, 236, 241, 0.4);
+  pointer-events: none;
+  z-index: 2;
 }
 
 /* ---------- transcript ---------- */
@@ -397,6 +475,7 @@ main {
 
 #qa-input::placeholder { color: var(--text-dim); }
 #qa-input:hover { border-color: #333a44; }
+#qa-input:disabled { opacity: 0.6; cursor: default; }
 
 #qa-go {
   flex-shrink: 0;
@@ -414,6 +493,7 @@ main {
 
 #qa-go:hover { background: #262c34; border-color: #333a44; }
 #qa-go:active { background: var(--bg-2); }
+#qa-go:disabled { opacity: 0.5; cursor: default; background: var(--bg-3); border-color: var(--border); }
 
 #qa-spinner {
   width: 14px;
@@ -442,6 +522,93 @@ main {
 
 #qa-results:empty { display: none; }
 
+.qa-abstain, .qa-error {
+  margin: 0;
+  padding: 10px 4px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.qa-error { color: #e57373; }
+
+/* ask: one .claim per grounded claim, with citation chips that deep-link
+   back into the transcript (and across meetings, via jumpTo). */
+
+.claim {
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.claim:last-child { border-bottom: none; }
+
+.claim-text {
+  margin: 0 0 6px;
+  color: var(--text-hi);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  --c: var(--text-dim);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--c);
+  border-radius: 3px;
+  color: var(--text-mid);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.chip:hover { background: var(--bg-3); color: var(--text-hi); border-color: #333a44; }
+
+/* search: one .hit per matching segment, same deep-link behavior as a chip. */
+
+.hit {
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--border-soft);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.hit:last-child { border-bottom: none; }
+.hit:hover { background: var(--bg-2); }
+
+.hit-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 3px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.hit-speaker {
+  --c: var(--text-dim);
+  color: var(--c);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.hit-time { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.hit-memory { margin-left: auto; color: var(--text-dim); }
+
+.hit-text {
+  margin: 0;
+  color: var(--text-mid);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 /* ---------- responsive ---------- */
 
 @media (max-width: 880px) {
@@ -451,6 +618,7 @@ main {
     overflow-y: auto;
   }
   #player-pane { border-right: none; border-bottom: 1px solid var(--border); overflow: visible; }
+  #timeline { flex: none; min-height: 160px; }
   #transcript { overflow-y: visible; }
   header { flex-wrap: wrap; height: auto; padding: 10px 16px; }
   #meeting-meta { margin-left: 0; width: 100%; order: 3; }
