@@ -1,3 +1,5 @@
+import dataclasses
+
 from fastapi.testclient import TestClient
 from vproc.config import Config, Endpoint
 from vproc.models import Answer
@@ -6,6 +8,9 @@ from vproc.service import create_app
 def _cfg():
     ep = Endpoint("u", "m")
     return Config(ep, ep, ep, "x", "0.0.0.0", 8765, 0.25, 0.5, None)
+
+def _cfg_with(cfg, **overrides):
+    return dataclasses.replace(cfg, **overrides)
 
 def test_healthz():
     app = create_app(store=object(), scorer=lambda p, h: 1.0, cfg=_cfg(),
@@ -195,3 +200,29 @@ def test_media_missing_file_404(tmp_path):
     r = TestClient(app).get("/api/media/gone")
     assert r.status_code == 404 and "missing.mkv" in r.json()["detail"]
     assert TestClient(app).get("/api/media/nope").status_code == 404
+
+
+def test_api_frames_serves_and_blocks_traversal(tmp_path, monkeypatch):
+    frames = tmp_path / "frames" / "default" / "standup"
+    frames.mkdir(parents=True)
+    (frames / "00000001.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("nope")
+    cfg = _cfg()
+    # inject frames_dir into whatever cfg object _cfg() returns (follow its type)
+    cfg = _cfg_with(cfg, frames_dir=str(tmp_path / "frames"))
+    app = create_app(store=_UIStore([]), scorer=lambda p, h: 1.0, cfg=cfg)
+    c = TestClient(app)
+    ok = c.get("/api/frames/standup/00000001.png")
+    assert ok.status_code == 200 and ok.content.startswith(b"\x89PNG")
+    assert c.get("/api/frames/standup/../../secret.txt").status_code in (404, 400)
+    assert c.get("/api/frames/standup/%2e%2e%2fsecret.txt").status_code in (404, 400)
+    assert c.get("/api/frames/standup/absent.png").status_code == 404
+
+
+def test_root_serves_ui_and_api_wins():
+    app = create_app(store=_UIStore([]), scorer=lambda p, h: 1.0, cfg=_cfg())
+    c = TestClient(app)
+    r = c.get("/")
+    assert r.status_code == 200 and "text/html" in r.headers["content-type"]
+    assert c.get("/healthz").json() == {"ok": True}  # routes still beat the mount

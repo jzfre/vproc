@@ -148,8 +148,38 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
                                        "(ingested from a different directory?)")
         return _range_response(path, request.headers.get("range"))
 
+    @app.get("/api/frames/{memory_id}/{name}")
+    def api_frame(memory_id: str, name: str):
+        # name is a single path segment already (FastAPI splits on "/"), but reject any
+        # ".." defensively too; memory_id likewise cannot contain "/" but ".." would
+        # still resolve outside frames_dir via os.path.join, so block it explicitly.
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or ".." in name or ".." in memory_id:
+            raise HTTPException(status_code=404, detail="bad frame name")
+        path = os.path.join(cfg.frames_dir, "default", memory_id, name)
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="no such frame")
+        from starlette.responses import FileResponse
+        return FileResponse(path, media_type="image/png")
+
     if mcp_app is not None:
         app.mount("/mcp", mcp_app)
+
+        # Starlette's Mount only matches "/mcp/..." (with trailing slash); a bare "/mcp"
+        # request normally falls through to the router's automatic redirect-slashes
+        # handling. The catch-all static mount below matches everything (it's a Mount
+        # at "/"), so it would swallow a bare "/mcp" as a FULL match before that
+        # fallback ever runs, turning it into a 405 from StaticFiles. Reproduce the
+        # redirect explicitly, registered (and thus matched) before the catch-all.
+        @app.api_route("/mcp", methods=["GET", "POST", "DELETE"], include_in_schema=False)
+        async def _mcp_trailing_slash_redirect():
+            from starlette.responses import RedirectResponse
+            return RedirectResponse(url="/mcp/", status_code=307)
+
+    # Static UI mount LAST so every route registered above wins over it.
+    ui_dir = os.path.join(os.path.dirname(__file__), "ui")
+    from starlette.staticfiles import StaticFiles
+    app.mount("/", StaticFiles(directory=ui_dir, html=True), name="ui")
+
     return app
 
 
