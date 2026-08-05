@@ -154,3 +154,44 @@ def test_api_segments_unknown_memory_404():
     app = create_app(store=_UIStore([]), scorer=lambda p, h: 1.0, cfg=_cfg())
     r = TestClient(app).get("/api/memories/nope/segments")
     assert r.status_code == 404 and "detail" in r.json()
+
+
+def _media_app(tmp_path, body=b"0123456789abcdef"):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(body)
+    rows = [{"id": "1", "memory_id": "clip", "project_id": "default", "speaker": "S",
+             "start_ts": 0.0, "end_ts": 1.0, "said_text": "", "on_screen_text": "",
+             "embed_text": "", "source_video": str(video), "frame_path": ""}]
+    return create_app(store=_UIStore(rows), scorer=lambda p, h: 1.0, cfg=_cfg())
+
+
+def test_media_full_and_ranges(tmp_path):
+    c = TestClient(_media_app(tmp_path))
+    full = c.get("/api/media/clip")
+    assert full.status_code == 200 and full.content == b"0123456789abcdef"
+    assert full.headers["content-type"] == "video/mp4"
+
+    part = c.get("/api/media/clip", headers={"Range": "bytes=4-7"})
+    assert part.status_code == 206 and part.content == b"4567"
+    assert part.headers["content-range"] == "bytes 4-7/16"
+
+    tail = c.get("/api/media/clip", headers={"Range": "bytes=12-"})
+    assert tail.status_code == 206 and tail.content == b"cdef"
+
+    suffix = c.get("/api/media/clip", headers={"Range": "bytes=-4"})
+    assert suffix.status_code == 206 and suffix.content == b"cdef"
+    assert suffix.headers["content-range"] == "bytes 12-15/16"
+
+    bad = c.get("/api/media/clip", headers={"Range": "bytes=99-"})
+    assert bad.status_code == 416
+
+
+def test_media_missing_file_404(tmp_path):
+    rows = [{"id": "1", "memory_id": "gone", "project_id": "default", "speaker": "S",
+             "start_ts": 0.0, "end_ts": 1.0, "said_text": "", "on_screen_text": "",
+             "embed_text": "", "source_video": str(tmp_path / "missing.mkv"),
+             "frame_path": ""}]
+    app = create_app(store=_UIStore(rows), scorer=lambda p, h: 1.0, cfg=_cfg())
+    r = TestClient(app).get("/api/media/gone")
+    assert r.status_code == 404 and "missing.mkv" in r.json()["detail"]
+    assert TestClient(app).get("/api/media/nope").status_code == 404
