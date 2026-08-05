@@ -150,9 +150,11 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
 
     @app.get("/api/frames/{memory_id}/{name}")
     def api_frame(memory_id: str, name: str):
-        # name is a single path segment already (FastAPI splits on "/"), but reject any
-        # ".." defensively too; memory_id likewise cannot contain "/" but ".." would
-        # still resolve outside frames_dir via os.path.join, so block it explicitly.
+        # The character-class regex alone is NOT sufficient: it allows dots, so a name of
+        # ".." or "..png" (no slash needed) passes it — the explicit ".." check is what
+        # actually blocks those. memory_id can't contain "/" either, but a bare ".."
+        # segment (e.g. from "%2e%2e") would still resolve one level up via
+        # os.path.join, so it gets the same explicit check.
         if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or ".." in name or ".." in memory_id:
             raise HTTPException(status_code=404, detail="bad frame name")
         path = os.path.join(cfg.frames_dir, "default", memory_id, name)

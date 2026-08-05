@@ -220,6 +220,40 @@ def test_api_frames_serves_and_blocks_traversal(tmp_path, monkeypatch):
     assert c.get("/api/frames/standup/absent.png").status_code == 404
 
 
+def test_api_frames_traversal_payloads_that_reach_the_guard(tmp_path):
+    # The two payloads above never actually exercise api_frame's ".." checks: httpx
+    # normalizes "../../" client-side before the request is sent, and "%2e%2e%2f"
+    # decodes to a literal "/" that makes the {name} path segment fail to match the
+    # route at all. Neither reaches the handler, so deleting its ".." checks wouldn't
+    # fail those assertions. These payloads DO reach the handler (confirmed: FastAPI
+    # matches memory_id="..", name="..png" respectively) and are only blocked by the
+    # explicit ".." checks in api_frame, since the character-class regex alone allows
+    # dots and would otherwise accept them.
+    frames = tmp_path / "frames" / "default" / "standup"
+    frames.mkdir(parents=True)
+    (frames / "00000001.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("nope")
+    cfg = _cfg_with(_cfg(), frames_dir=str(tmp_path / "frames"))
+    app = create_app(store=_UIStore([]), scorer=lambda p, h: 1.0, cfg=cfg)
+    c = TestClient(app)
+
+    r1 = c.get("/api/frames/%2e%2e/secret.txt")  # memory_id decodes to ".."
+    assert r1.status_code == 404
+    assert "nope" not in r1.text
+    # Pin the exact rejection reason, not just the status code: os.path.isfile() would
+    # also 404 (as "no such frame") for these paths even with the ".." checks deleted,
+    # since the fixed "default" path segment means a single ".." can only cancel it out
+    # and land back inside frames_dir itself, not reach tmp_path/secret.txt (one level
+    # further up) — so a bare status-code assertion can't distinguish "guard fired" from
+    # "guard absent, file coincidentally missing". The detail message can.
+    assert r1.json()["detail"] == "bad frame name"
+
+    r2 = c.get("/api/frames/standup/..png")  # name passes the char-class regex
+    assert r2.status_code == 404
+    assert r2.json()["detail"] == "bad frame name"
+
+
 def test_root_serves_ui_and_api_wins():
     app = create_app(store=_UIStore([]), scorer=lambda p, h: 1.0, cfg=_cfg())
     c = TestClient(app)
