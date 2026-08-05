@@ -17,8 +17,33 @@ function escapeHtml(str) {
   ));
 }
 
+// fetch() + res.ok + .json(), collapsed into one throwing call so callers can
+// render a friendly inline error instead of crashing on a network failure or
+// an error response whose JSON body still parses fine (e.g. a 404 {detail}).
+async function fetchJson(url, opts) {
+  let res;
+  try {
+    res = await fetch(url, opts);
+  } catch (e) {
+    throw new Error("network error — is the server running?");
+  }
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).detail || ""; } catch (_) { /* body wasn't JSON */ }
+    throw new Error(detail || `${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
 async function boot() {
-  state.memories = await (await fetch("/api/memories")).json();
+  let memories;
+  try {
+    memories = await fetchJson("/api/memories");
+  } catch (e) {
+    showEmptyState(e.message);
+    return;
+  }
+  state.memories = Array.isArray(memories) ? memories : [];
   const picker = $("memory-picker");
   picker.innerHTML = state.memories.map(m =>
     `<option value="${escapeHtml(m.memory_id)}">${escapeHtml(m.memory_id)}</option>`).join("");
@@ -28,7 +53,7 @@ async function boot() {
   loadMemory(wanted && state.memories.some(m => m.memory_id === wanted) ? wanted : state.memories[0].memory_id);
 }
 
-function showEmptyState() {
+function showEmptyState(errorMessage) {
   const picker = $("memory-picker");
   picker.innerHTML = `<option value="">no memories</option>`;
   picker.disabled = true;
@@ -36,19 +61,33 @@ function showEmptyState() {
   $("video").hidden = true;
   const fallback = $("video-fallback");
   fallback.hidden = false;
-  fallback.innerHTML = `<p>No memories yet.</p>
-    <p class="detail">Run <code>vproc ingest &lt;video.mp4&gt;</code>, then reload this page.</p>`;
+  fallback.innerHTML = errorMessage
+    ? `<p>Could not load meetings.</p><p class="detail">${escapeHtml(errorMessage)}</p>`
+    : `<p>No memories yet.</p>
+       <p class="detail">Run <code>vproc ingest &lt;video.mp4&gt;</code>, then reload this page.</p>`;
   setNowSpeaking(null);
-  $("transcript").innerHTML = `<p class="empty">Transcript segments will appear here once a meeting is ingested.</p>`;
+  $("transcript").innerHTML = errorMessage
+    ? `<p class="empty">Reload the page once the server is back.</p>`
+    : `<p class="empty">Transcript segments will appear here once a meeting is ingested.</p>`;
 }
 
 async function loadMemory(id) {
   state.current = id;
   history.replaceState(null, "", `?memory=${encodeURIComponent(id)}`);
   $("memory-picker").value = id;
-  state.segments = await (await fetch(`/api/memories/${encodeURIComponent(id)}/segments`)).json();
+  let segments;
+  try {
+    segments = await fetchJson(`/api/memories/${encodeURIComponent(id)}/segments`);
+  } catch (e) {
+    state.segments = [];
+    $("transcript").innerHTML = `<p class="empty">Could not load this meeting's transcript.</p>
+      <p class="empty empty-detail">${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  state.segments = Array.isArray(segments) ? segments : [];
   const m = state.memories.find(x => x.memory_id === id);
-  $("meeting-meta").textContent = `${fmt(m.duration_s)} · ${m.speakers.length} speakers · ${m.segment_count} segments`;
+  $("meeting-meta").textContent = m
+    ? `${fmt(m.duration_s)} · ${m.speakers.length} speakers · ${m.segment_count} segments` : "";
   const video = $("video");
   $("video-fallback").hidden = true; video.hidden = false;
   video.src = `/api/media/${encodeURIComponent(id)}`;

@@ -258,6 +258,12 @@ main {
   text-align: center;
 }
 
+#transcript .empty-detail {
+  margin-top: -12px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
 .seg {
   --c: var(--text-dim);
   background: var(--bg-1);
