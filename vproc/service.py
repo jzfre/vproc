@@ -1,7 +1,7 @@
 import os
 import re
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from vproc.answer.ask import ask_memory, search_memory
@@ -40,39 +40,6 @@ def build_where(q: Query) -> str | None:
 
 _VIDEO_TYPES = {"mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime",
                 "mkv": "video/x-matroska", "webm": "video/webm"}
-
-
-def _range_response(path: str, range_header: str | None):
-    size = os.path.getsize(path)
-    ctype = _VIDEO_TYPES.get(path.rsplit(".", 1)[-1].lower(), "application/octet-stream")
-    m = re.match(r"bytes=(\d*)-(\d*)$", range_header or "")
-    if not m or (not m.group(1) and not m.group(2)):
-        from starlette.responses import FileResponse
-        return FileResponse(path, media_type=ctype, headers={"Accept-Ranges": "bytes"})
-    if m.group(1):
-        start = int(m.group(1))
-        end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
-    else:  # bytes=-n : final n bytes
-        start = max(size - int(m.group(2)), 0)
-        end = size - 1
-    if start >= size or start > end:
-        raise HTTPException(status_code=416, detail="range not satisfiable")
-
-    def _iter():
-        with open(path, "rb") as f:
-            f.seek(start)
-            remaining = end - start + 1
-            while remaining > 0:
-                chunk = f.read(min(1 << 20, remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-                yield chunk
-
-    from starlette.responses import StreamingResponse
-    return StreamingResponse(_iter(), status_code=206, media_type=ctype, headers={
-        "Content-Range": f"bytes {start}-{end}/{size}",
-        "Content-Length": str(end - start + 1), "Accept-Ranges": "bytes"})
 
 
 def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_memory) -> FastAPI:
@@ -136,17 +103,28 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
             for r in rows
         ]
 
+    # memory_id -> source_video path. source_video for a memory never changes within a
+    # serve process (re-ingest replaces rows but keeps the same path), so a plain dict
+    # with no invalidation is safe here and avoids a full store scan on every Range
+    # request a <video> element makes while seeking.
+    media_path_cache: dict[str, str] = {}
+
     @app.get("/api/media/{memory_id}")
-    def api_media(memory_id: str, request: Request):
-        rows = store.memory_rows(memory_id, "default")
-        if not rows:
-            raise HTTPException(status_code=404, detail=f"no memory '{memory_id}'")
-        path = rows[0]["source_video"]
+    def api_media(memory_id: str):
+        _safe(memory_id, "memory")
+        path = media_path_cache.get(memory_id)
+        if path is None:
+            rows = store.memory_rows(memory_id, "default")
+            if not rows:
+                raise HTTPException(status_code=404, detail=f"no memory '{memory_id}'")
+            path = media_path_cache[memory_id] = rows[0]["source_video"]
         if not os.path.exists(path):
             raise HTTPException(status_code=404,
                                 detail=f"video file not found: {path} "
                                        "(ingested from a different directory?)")
-        return _range_response(path, request.headers.get("range"))
+        ctype = _VIDEO_TYPES.get(path.rsplit(".", 1)[-1].lower(), "application/octet-stream")
+        from starlette.responses import FileResponse
+        return FileResponse(path, media_type=ctype)
 
     @app.get("/api/frames/{memory_id}/{name}")
     def api_frame(memory_id: str, name: str):
@@ -178,9 +156,11 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
             return RedirectResponse(url="/mcp/", status_code=307)
 
     # Static UI mount LAST so every route registered above wins over it.
+    # check_dir=False: a missing ui/ dir (e.g. a stripped-down install) shouldn't take
+    # down the whole API at import time — requests under it just 404 instead.
     ui_dir = os.path.join(os.path.dirname(__file__), "ui")
     from starlette.staticfiles import StaticFiles
-    app.mount("/", StaticFiles(directory=ui_dir, html=True), name="ui")
+    app.mount("/", StaticFiles(directory=ui_dir, html=True, check_dir=False), name="ui")
 
     return app
 

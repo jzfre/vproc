@@ -529,7 +529,9 @@ main {
   font-size: 13px;
 }
 
-.qa-error { color: #e57373; }
+/* Not byte-equal to any SPEAKER_COLORS entry in app.js — color==speaker identity
+   throughout this stylesheet, so an error can't visually alias a real speaker. */
+.qa-error { color: #d9534f; }
 
 /* ask: one .claim per grounded claim, with citation chips that deep-link
    back into the transcript (and across meetings, via jumpTo). */

@@ -25,7 +25,7 @@ async function fetchJson(url, opts) {
   try {
     res = await fetch(url, opts);
   } catch (e) {
-    throw new Error("network error — is the server running?");
+    throw new Error("network error — is the server running?", {cause: e});
   }
   if (!res.ok) {
     let detail = "";
@@ -72,6 +72,7 @@ function showEmptyState(errorMessage) {
 }
 
 async function loadMemory(id) {
+  const prev = state.current;
   state.current = id;
   history.replaceState(null, "", `?memory=${encodeURIComponent(id)}`);
   $("memory-picker").value = id;
@@ -79,9 +80,22 @@ async function loadMemory(id) {
   try {
     segments = await fetchJson(`/api/memories/${encodeURIComponent(id)}/segments`);
   } catch (e) {
-    state.segments = [];
-    $("transcript").innerHTML = `<p class="empty">Could not load this meeting's transcript.</p>
-      <p class="empty empty-detail">${escapeHtml(e.message)}</p>`;
+    // Roll back — a failed switch must not strand the UI on a memory_id that
+    // isn't in state.memories (renderTimeline/updatePlayhead/jumpTo all key off
+    // state.current, and a bad id there makes them dead-end on duration=0).
+    state.current = prev;
+    $("memory-picker").value = prev ?? "";
+    history.replaceState(null, "", prev ? `?memory=${encodeURIComponent(prev)}` : location.pathname);
+    if (prev === null) {
+      // Nothing was loaded before this attempt — no old render to preserve.
+      state.segments = [];
+      $("transcript").innerHTML = `<p class="empty">Could not load this meeting's transcript.</p>
+        <p class="empty empty-detail">${escapeHtml(e.message)}</p>`;
+    } else {
+      // Leave the previous memory's segments/render intact so the UI stays fully
+      // usable on it; just log the failed switch instead of tearing it down.
+      console.error(`failed to switch to memory '${id}':`, e.message);
+    }
     return;
   }
   state.segments = Array.isArray(segments) ? segments : [];
@@ -127,7 +141,7 @@ function renderTimeline() {
     return `
       <div class="lane">
         <div class="lane-label" style="--c:${color}">${escapeHtml(speaker)}</div>
-        <div class="lane-track">${turns}</div>
+        <div class="lane-track" tabindex="0" aria-label="timeline: click to seek">${turns}</div>
       </div>`;
   }).join("");
   timeline.innerHTML = `<div class="lanes">${lanes}<div id="playhead"></div></div>`;
@@ -146,6 +160,11 @@ function updatePlayhead() {
   const frac = duration ? Math.min(Math.max($("video").currentTime / duration, 0), 1) : 0;
   playhead.style.left = `${track.offsetLeft + frac * track.offsetWidth}px`;
 }
+
+// Track rects/playhead are positioned in pixels off .lane-track's live layout, which
+// shifts on viewport/pane resize — recompute the playhead so it doesn't drift out of
+// sync with the turn rects.
+window.addEventListener("resize", () => updatePlayhead());
 
 $("timeline").addEventListener("click", (e) => {
   const track = e.target.closest(".lane-track");

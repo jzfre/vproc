@@ -144,6 +144,29 @@ def test_api_memories_aggregates():
     assert m["speakers"] == ["Repan, Jozef", "Vanco, Pavol"]
 
 
+def test_api_memories_excludes_non_default_project():
+    rows = _ui_rows() + [
+        {"id": "3", "memory_id": "other-proj-meeting", "project_id": "acme",
+         "speaker": "X", "start_ts": 0.0, "end_ts": 5.0, "said_text": "", "on_screen_text": "",
+         "embed_text": "", "source_video": "tmp/other.mkv", "frame_path": ""},
+    ]
+    app = create_app(store=_UIStore(rows), scorer=lambda p, h: 1.0, cfg=_cfg())
+    memory_ids = [m["memory_id"] for m in TestClient(app).get("/api/memories").json()]
+    assert "other-proj-meeting" not in memory_ids
+    assert memory_ids == ["standup"]
+
+
+def test_api_memories_sorted_by_memory_id():
+    rows = _ui_rows() + [
+        {"id": "3", "memory_id": "all-hands", "project_id": "default", "speaker": "X",
+         "start_ts": 0.0, "end_ts": 5.0, "said_text": "", "on_screen_text": "",
+         "embed_text": "", "source_video": "tmp/all-hands.mkv", "frame_path": ""},
+    ]
+    app = create_app(store=_UIStore(rows), scorer=lambda p, h: 1.0, cfg=_cfg())
+    memory_ids = [m["memory_id"] for m in TestClient(app).get("/api/memories").json()]
+    assert memory_ids == ["all-hands", "standup"]  # sorted, not insertion order
+
+
 def test_api_segments_ordered_with_frame_name():
     app = create_app(store=_UIStore(_ui_rows()), scorer=lambda p, h: 1.0, cfg=_cfg())
     c = TestClient(app)
@@ -252,6 +275,16 @@ def test_api_frames_traversal_payloads_that_reach_the_guard(tmp_path):
     r2 = c.get("/api/frames/standup/..png")  # name passes the char-class regex
     assert r2.status_code == 404
     assert r2.json()["detail"] == "bad frame name"
+
+
+def test_missing_ui_dir_does_not_crash_app_creation(tmp_path, monkeypatch):
+    # check_dir=False on the static mount: create_app() must not raise even when
+    # vproc/ui doesn't exist (e.g. a stripped install), and the real API routes —
+    # registered before the mount — keep working regardless.
+    import vproc.service as svc
+    monkeypatch.setattr(svc, "__file__", str(tmp_path / "service.py"))
+    app = create_app(store=_UIStore([]), scorer=lambda p, h: 1.0, cfg=_cfg())
+    assert TestClient(app).get("/healthz").json() == {"ok": True}
 
 
 def test_root_serves_ui_and_api_wins():
