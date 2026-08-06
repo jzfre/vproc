@@ -96,3 +96,22 @@ class Store:
             return q.to_list()
         except Exception:
             return []
+
+    def all_rows(self) -> list[dict]:
+        """Every row minus the vector column. Full scan — fine at personal scale.
+        Drop the vector column from the Arrow table BEFORE to_pylist() so the
+        (large) embedding data is never materialized into Python objects just to
+        be discarded a line later."""
+        table = self._table()
+        if table is None:
+            return []
+        tbl = table.to_arrow()
+        if "vector" in tbl.column_names:
+            tbl = tbl.drop_columns(["vector"])
+        return tbl.to_pylist()
+
+    def memory_rows(self, memory_id: str, project_id: str | None = None) -> list[dict]:
+        """All rows for a memory (no vector column)."""
+        return [r for r in self.all_rows()
+                if r["memory_id"] == memory_id
+                and (project_id is None or r["project_id"] == project_id)]
