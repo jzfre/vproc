@@ -1,4 +1,7 @@
 const state = {memories: [], current: null, segments: []};
+let memoryLoadVersion = 0;
+let mediaVersion = 0;
+let pendingSeek = null;
 const $ = (id) => document.getElementById(id);
 const fmt = (t) => `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
 
@@ -72,45 +75,56 @@ function showEmptyState(errorMessage) {
 }
 
 async function loadMemory(id) {
-  const prev = state.current;
-  state.current = id;
-  history.replaceState(null, "", `?memory=${encodeURIComponent(id)}`);
+  const version = ++memoryLoadVersion;
   $("memory-picker").value = id;
+  $("meeting-status").textContent = "";
+  if (id === state.current) return true;
+  $("meeting-status").textContent = "Loading meeting…";
   let segments;
   try {
     segments = await fetchJson(`/api/memories/${encodeURIComponent(id)}/segments`);
   } catch (e) {
-    // Roll back — a failed switch must not strand the UI on a memory_id that
-    // isn't in state.memories (renderTimeline/updatePlayhead/jumpTo all key off
-    // state.current, and a bad id there makes them dead-end on duration=0).
-    state.current = prev;
-    $("memory-picker").value = prev ?? "";
-    history.replaceState(null, "", prev ? `?memory=${encodeURIComponent(prev)}` : location.pathname);
-    if (prev === null) {
+    if (version !== memoryLoadVersion) return false;
+    $("memory-picker").value = state.current ?? "";
+    $("meeting-status").textContent = `Could not load ${id}: ${e.message}`;
+    if (state.current === null) {
       // Nothing was loaded before this attempt — no old render to preserve.
       state.segments = [];
       $("transcript").innerHTML = `<p class="empty">Could not load this meeting's transcript.</p>
         <p class="empty empty-detail">${escapeHtml(e.message)}</p>`;
-    } else {
-      // Leave the previous memory's segments/render intact so the UI stays fully
-      // usable on it; just log the failed switch instead of tearing it down.
-      console.error(`failed to switch to memory '${id}':`, e.message);
     }
-    return;
+    return false;
   }
+  // Keep the displayed recording and transcript together until the latest
+  // selection has loaded; earlier requests may complete out of order.
+  if (version !== memoryLoadVersion) return false;
+  state.current = id;
+  history.replaceState(null, "", `?memory=${encodeURIComponent(id)}`);
+  $("meeting-status").textContent = "";
   state.segments = Array.isArray(segments) ? segments : [];
   const m = state.memories.find(x => x.memory_id === id);
   $("meeting-meta").textContent = m
     ? `${fmt(m.duration_s)} · ${m.speakers.length} speakers · ${m.segment_count} segments` : "";
   const video = $("video");
+  mediaVersion++;
+  pendingSeek = null;
   $("video-fallback").hidden = true; video.hidden = false;
   video.src = `/api/media/${encodeURIComponent(id)}`;
   renderTranscript();
   renderTimeline();
   syncActive();
+  return true;
 }
 
-function seek(t) { const v = $("video"); v.currentTime = t; v.play?.()?.catch(() => {}); }
+function seek(t) {
+  const v = $("video");
+  // A new src can reset currentTime while metadata loads. Reapply a citation's
+  // target once the new recording is ready, before starting playback.
+  pendingSeek = v.readyState === 0 && !v.error ? t : null;
+  v.currentTime = t;
+  syncActive();
+  if (pendingSeek === null && !v.error) v.play?.()?.catch(() => {});
+}
 
 // Speaker timeline: one lane per speaker (first-appearance order in the
 // transcript), turn rects positioned/sized proportionally to the meeting's
@@ -241,11 +255,17 @@ function syncActive() {
 }
 
 $("video").addEventListener("timeupdate", syncActive);
+$("video").addEventListener("loadedmetadata", () => {
+  if (pendingSeek !== null) seek(pendingSeek);
+});
 $("video").addEventListener("error", async () => {
+  const version = mediaVersion;
   const video = $("video");
+  if (pendingSeek !== null) seek(pendingSeek);
   const fallback = $("video-fallback");
   video.hidden = true;
   fallback.hidden = false;
+  fallback.innerHTML = `<p>Video unavailable.</p><p class="detail">Checking the recording…</p>`;
   let detail = "";
   if (state.current) {
     try {
@@ -253,6 +273,7 @@ $("video").addEventListener("error", async () => {
       if (res.status === 404) detail = (await res.json()).detail || "";
     } catch (_) { /* couldn't reach the server to explain why; fall through to the codec note */ }
   }
+  if (version !== mediaVersion) return;
   fallback.innerHTML = detail
     ? `<p>Video unavailable.</p><p class="detail">${escapeHtml(detail)}</p>`
     : `<p>Video unavailable.</p>
@@ -266,12 +287,15 @@ $("video").addEventListener("error", async () => {
 // can legitimately take well over a minute. The spinner + disabled controls
 // are the only "is this still working" signal, not a request deadline.
 async function runQuery() {
+  if ($("qa-go").disabled) return;
   const mode = $("qa-mode").value;
   const q = $("qa-input").value.trim();
   if (!q) return;
   $("qa-spinner").hidden = false;
   $("qa-go").disabled = true;
   $("qa-input").disabled = true;
+  $("qa-mode").disabled = true;
+  $("qa-results").innerHTML = "";
   try {
     if (mode === "ask") {
       const a = await fetchJson("/ask", {
@@ -294,6 +318,7 @@ async function runQuery() {
     $("qa-spinner").hidden = true;
     $("qa-go").disabled = false;
     $("qa-input").disabled = false;
+    $("qa-mode").disabled = false;
   }
 }
 
@@ -337,10 +362,7 @@ function renderSearchResults(hits) {
 // vproc/answer/evidence.py); jump across meetings when it differs from the
 // one currently loaded, then seek within it.
 async function jumpTo(c) {
-  if (c.memory_title !== state.current) {
-    await loadMemory(c.memory_title);
-  }
-  seek(c.start_ts);
+  if (await loadMemory(c.memory_title)) seek(c.start_ts);
 }
 
 function jumpFromResults(target) {
@@ -354,7 +376,7 @@ $("qa-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") runQuery();
 });
 $("qa-mode").addEventListener("change", () => {
-  $("qa-input").placeholder = $("qa-mode").value === "ask" ? "Ask this meeting…" : "Search this meeting…";
+  $("qa-input").placeholder = $("qa-mode").value === "ask" ? "Ask across all meetings…" : "Search all meetings…";
 });
 $("qa-results").addEventListener("click", (e) => jumpFromResults(e.target));
 $("qa-results").addEventListener("keydown", (e) => {

@@ -1,4 +1,5 @@
 import base64
+import math
 import mimetypes
 import wave
 
@@ -23,11 +24,28 @@ EMBED_BATCH = 32
 
 def embed_texts(base_url: str, model: str, texts: list[str]) -> list[list[float]]:
     out: list[list[float]] = []
+    dimensions = None
     for i in range(0, len(texts), EMBED_BATCH):
-        resp = _client(base_url).embeddings.create(model=model, input=texts[i:i + EMBED_BATCH])
+        batch = texts[i:i + EMBED_BATCH]
+        resp = _client(base_url).embeddings.create(model=model, input=batch)
         # The API pairs each vector to its input via `index`; list order is not contractual.
+        # Reject incomplete/duplicate batches before callers can pair them with segments.
+        if (not isinstance(resp.data, list) or len(resp.data) != len(batch)
+                or any(type(d.index) is not int for d in resp.data)):
+            raise ValueError("invalid embedding response indices")
         data = sorted(resp.data, key=lambda d: d.index)
-        out.extend(list(d.embedding) for d in data)
+        if [d.index for d in data] != list(range(len(batch))):
+            raise ValueError("invalid embedding response indices")
+        for d in data:
+            vector = d.embedding
+            if (not isinstance(vector, list) or not vector
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in vector)):
+                raise ValueError("invalid embedding response vector")
+            if dimensions is None:
+                dimensions = len(vector)
+            if len(vector) != dimensions:
+                raise ValueError("inconsistent embedding response vector dimensions")
+            out.append(list(vector))
     return out
 
 

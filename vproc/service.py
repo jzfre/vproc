@@ -1,11 +1,19 @@
+import logging
 import os
 import re
+import unicodedata
+from pathlib import Path
+from threading import Lock
 
 from fastapi import FastAPI, HTTPException
+from openai import APIError, APITimeoutError
 from pydantic import BaseModel
 
 from vproc.answer.ask import ask_memory, search_memory
 from vproc.config import load_config
+from vproc.errors import IndexBusyError, IndexCompatibilityError
+
+logger = logging.getLogger(__name__)
 
 # Filter values are interpolated into a LanceDB SQL-style .where() string. Memory/speaker
 # ids are arbitrary filename stems / diarized names, so accept any short string and just
@@ -22,7 +30,7 @@ class Query(BaseModel):
 
 
 def _safe(value: str, field: str) -> str:
-    if len(value) > 128 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+    if len(value) > 128 or any(unicodedata.category(c) == "Cc" for c in value):
         raise HTTPException(status_code=400, detail=f"invalid {field} filter")
     return value.replace("'", "''")  # escape single quotes for the SQL-style filter
 
@@ -38,6 +46,38 @@ def build_where(q: Query) -> str | None:
     return " AND ".join(clauses) if clauses else None
 
 
+def _query_text(value: str | None, field: str) -> str:
+    if value is None or not value.strip():
+        raise HTTPException(status_code=400, detail=f"{field} is required")
+    if len(value) > 8192:
+        raise HTTPException(status_code=400, detail=f"{field} must be at most 8192 characters")
+    return value
+
+
+def _backend(call):
+    """Keep backend exceptions, response bodies, and credentials out of both APIs."""
+    try:
+        return call()
+    except Exception as exc:
+        if isinstance(exc, IndexCompatibilityError):
+            status, detail = 409, (
+                "Index embedding identity is missing or incompatible with the configured model. "
+                "Use the original embedding model, or set a new VPROC_INDEX_PATH and re-ingest."
+            )
+        elif isinstance(exc, IndexBusyError):
+            status, detail = 503, "Index is being updated. Retry after the current operation completes."
+        elif isinstance(exc, APITimeoutError):
+            status, detail = 504, "Model backend timed out. Check the backend and retry."
+        elif isinstance(exc, APIError):
+            status, detail = 503, "Model backend unavailable. Check its service and configuration, then retry."
+        else:
+            status, detail = 500, "Request failed. Check the service logs and retry."
+        # SDK exception messages can contain response bodies or authenticated URLs.
+        # MCP also logs surfaced tool errors, so only expose these fixed messages.
+        logger.warning("Request failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=status, detail=detail) from None
+
+
 _VIDEO_TYPES = {"mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime",
                 "mkv": "video/x-matroska", "webm": "video/webm"}
 
@@ -48,31 +88,51 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
         from vproc.store.lancedb_store import Store
         store = Store(cfg.index_path)
     if scorer is None:
-        from vproc.answer.faithfulness import HHEM
-        scorer = HHEM(cfg.hhem_model).score
+        verifier = None
+        verifier_lock = Lock()
 
-    mcp_app, lifespan = _build_mcp(store, cfg, scorer, ask, search)
+        def scorer(premise, hypothesis):
+            nonlocal verifier
+            # Browsing/search need no local verifier. Serialize both its first load
+            # and inference because REST and MCP may score on different threads.
+            with verifier_lock:
+                if verifier is None:
+                    from vproc.answer.faithfulness import HHEM
+                    verifier = HHEM(cfg.hhem_model)
+                return verifier.score(premise, hypothesis)
+
+    def ask_route(q: Query):
+        question = _query_text(q.question, "question")
+        where = build_where(q)
+        return _backend(lambda: ask(store, cfg, question, scorer, where=where).model_dump())
+
+    def search_route(q: Query):
+        query = _query_text(q.query if q.query is not None else q.question, "query")
+        where = build_where(q)
+        return _backend(lambda: [e.model_dump() for e in search(store, cfg, query, where=where)])
+
+    mcp_app, lifespan = _build_mcp(ask_route, search_route)
     app = FastAPI(title="vproc", lifespan=lifespan)
+    app.post("/ask")(ask_route)
+    app.post("/search")(search_route)
 
     @app.get("/healthz")
     def healthz():
         return {"ok": True}
 
-    @app.post("/ask")
-    def ask_route(q: Query):
-        question = q.question or ""
-        if not question.strip():
-            raise HTTPException(status_code=400, detail="question is required")
-        answer = ask(store, cfg, question, scorer, where=build_where(q))
-        return answer.model_dump()
-
-    @app.post("/search")
-    def search_route(q: Query):
-        query = q.query or q.question or ""
-        if not query.strip():
-            raise HTTPException(status_code=400, detail="query is required")
-        evidence = search(store, cfg, query, where=build_where(q))
-        return [e.model_dump() for e in evidence]
+    @app.get("/api/status")
+    def api_status():
+        status = {"mcp_available": mcp_app is not None, "index_compatible": None}
+        validate = getattr(store, "validate_embedding_model", None)
+        if validate is not None:
+            try:
+                _backend(lambda: validate(cfg.embed.model))
+                status["index_compatible"] = True
+            except HTTPException as exc:
+                if exc.status_code == 409:
+                    status["index_compatible"] = False
+                status["detail"] = exc.detail
+        return status
 
     @app.get("/api/memories")
     def api_memories():
@@ -89,8 +149,7 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
 
     @app.get("/api/memories/{memory_id}/segments")
     def api_segments(memory_id: str):
-        # _safe validates length/control-chars; its escaped return isn't used here —
-        # memory_rows filters in Python (no SQL), so escaping would break ids with quotes.
+        # memory_rows escapes its own SQL values; pass the original identifier.
         _safe(memory_id, "memory")
         rows = store.memory_rows(memory_id, "default")
         if not rows:
@@ -103,22 +162,14 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
             for r in rows
         ]
 
-    # memory_id -> source_video path. source_video for a memory never changes within a
-    # serve process (re-ingest replaces rows but keeps the same path), so a plain dict
-    # with no invalidation is safe here and avoids a full store scan on every Range
-    # request a <video> element makes while seeking.
-    media_path_cache: dict[str, str] = {}
-
     @app.get("/api/media/{memory_id}")
     def api_media(memory_id: str):
         _safe(memory_id, "memory")
-        path = media_path_cache.get(memory_id)
-        if path is None:
-            rows = store.memory_rows(memory_id, "default")
-            if not rows:
-                raise HTTPException(status_code=404, detail=f"no memory '{memory_id}'")
-            path = media_path_cache[memory_id] = rows[0]["source_video"]
-        if not os.path.exists(path):
+        rows = store.memory_rows(memory_id, "default")
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"no memory '{memory_id}'")
+        path = rows[0]["source_video"]
+        if not os.path.isfile(path):
             raise HTTPException(status_code=404,
                                 detail=f"video file not found: {path} "
                                        "(ingested from a different directory?)")
@@ -135,8 +186,9 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
         # os.path.join, so it gets the same explicit check.
         if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or ".." in name or ".." in memory_id:
             raise HTTPException(status_code=404, detail="bad frame name")
-        path = os.path.join(cfg.frames_dir, "default", memory_id, name)
-        if not os.path.isfile(path):
+        root = (Path(cfg.frames_dir).expanduser() / "default").resolve()
+        path = (root / memory_id / name).resolve()
+        if not path.is_relative_to(root) or not path.is_file():
             raise HTTPException(status_code=404, detail="no such frame")
         from starlette.responses import FileResponse
         return FileResponse(path, media_type="image/png")
@@ -156,16 +208,17 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
             return RedirectResponse(url="/mcp/", status_code=307)
 
     # Static UI mount LAST so every route registered above wins over it.
-    # check_dir=False: a missing ui/ dir (e.g. a stripped-down install) shouldn't take
-    # down the whole API at import time — requests under it just 404 instead.
+    # An API-only install should return 404 for UI paths. check_dir=False merely
+    # defers StaticFiles' missing-directory exception until the first request.
     ui_dir = os.path.join(os.path.dirname(__file__), "ui")
     from starlette.staticfiles import StaticFiles
-    app.mount("/", StaticFiles(directory=ui_dir, html=True, check_dir=False), name="ui")
+    if os.path.isdir(ui_dir):
+        app.mount("/", StaticFiles(directory=ui_dir, html=True), name="ui")
 
     return app
 
 
-def _build_mcp(store, cfg, scorer, ask, search):
+def _build_mcp(ask, search):
     """Build the MCP streamable-HTTP sub-app plus a FastAPI lifespan that runs its
     session manager (mounted sub-app lifespans are never executed otherwise). The tools
     are async and offload the blocking ask/search calls so they don't stall the event
@@ -176,19 +229,26 @@ def _build_mcp(store, cfg, scorer, ask, search):
 
         import anyio
         from mcp.server.fastmcp import FastMCP
+        from mcp.server.fastmcp.exceptions import ToolError
         from mcp.server.transport_security import TransportSecuritySettings
 
         mcp = FastMCP("vproc")
 
-        @mcp.tool()
-        async def ask_memory_tool(question: str) -> dict:
-            answer = await anyio.to_thread.run_sync(lambda: ask(store, cfg, question, scorer))
-            return answer.model_dump()
+        async def run_tool(call, q):
+            try:
+                return await anyio.to_thread.run_sync(lambda: call(q))
+            except HTTPException as exc:
+                raise ToolError(exc.detail) from None
 
         @mcp.tool()
-        async def search_memory_tool(query: str) -> list:
-            hits = await anyio.to_thread.run_sync(lambda: search(store, cfg, query))
-            return [e.model_dump() for e in hits]
+        async def ask_memory_tool(question: str, project: str | None = None,
+                                  memory: str | None = None, speaker: str | None = None) -> dict:
+            return await run_tool(ask, Query(question=question, project=project, memory=memory, speaker=speaker))
+
+        @mcp.tool()
+        async def search_memory_tool(query: str, project: str | None = None,
+                                     memory: str | None = None, speaker: str | None = None) -> list:
+            return await run_tool(search, Query(query=query, project=project, memory=memory, speaker=speaker))
 
         mcp.settings.streamable_http_path = "/"  # mounted at /mcp -> endpoint is /mcp
         # This is a LAN service bound to 0.0.0.0 and reached by hostname, so the default
@@ -202,5 +262,6 @@ def _build_mcp(store, cfg, scorer, ask, search):
                 yield
 
         return mcp_app, lifespan
-    except Exception:
+    except Exception as exc:
+        logger.warning("MCP unavailable after setup failure (%s); REST remains available", type(exc).__name__)
         return None, None

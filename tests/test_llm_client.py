@@ -1,4 +1,7 @@
 import wave
+from types import SimpleNamespace
+
+import pytest
 
 import vproc.llm.client as c
 
@@ -53,6 +56,44 @@ def test_embed_texts_chunks_large_batches(monkeypatch):
     assert len(out) == 70
     assert out == [[float(i + 1)] for i in range(70)]  # order preserved across chunks
     assert fake.embeddings.batch_sizes == [32, 32, 6]  # no request exceeds the cap
+
+
+@pytest.mark.parametrize("indices", [[], [0], [0, 0], [1, 2], [-1, 0]])
+def test_embed_texts_rejects_missing_or_mispaired_vectors(monkeypatch, indices):
+    response = SimpleNamespace(data=[
+        SimpleNamespace(index=i, embedding=[1.0, 2.0]) for i in indices
+    ])
+    fake = SimpleNamespace(embeddings=SimpleNamespace(create=lambda **kw: response))
+    monkeypatch.setattr(c, "_client", lambda base_url: fake)
+    with pytest.raises(ValueError, match="embedding.*indices"):
+        c.embed_texts("u", "m", ["first segment", "second segment"])
+
+
+@pytest.mark.parametrize("vectors", [
+    [[], []], [[1.0], [1.0, 2.0]], [[float("nan")], [1.0]],
+    [[float("inf")], [1.0]], [["1.0"], [1.0]],
+])
+def test_embed_texts_rejects_invalid_vectors(monkeypatch, vectors):
+    response = SimpleNamespace(data=[
+        SimpleNamespace(index=i, embedding=vector) for i, vector in enumerate(vectors)
+    ])
+    fake = SimpleNamespace(embeddings=SimpleNamespace(create=lambda **kw: response))
+    monkeypatch.setattr(c, "_client", lambda base_url: fake)
+    with pytest.raises(ValueError, match="embedding.*vector"):
+        c.embed_texts("u", "m", ["first segment", "second segment"])
+
+
+def test_embed_texts_rejects_dimension_changes_between_batches(monkeypatch):
+    def create(**kwargs):
+        texts = kwargs["input"]
+        return SimpleNamespace(data=[
+            SimpleNamespace(index=i, embedding=[1.0] * (2 if text == "last" else 1))
+            for i, text in enumerate(texts)
+        ])
+    fake = SimpleNamespace(embeddings=SimpleNamespace(create=create))
+    monkeypatch.setattr(c, "_client", lambda base_url: fake)
+    with pytest.raises(ValueError, match="embedding.*vector"):
+        c.embed_texts("u", "m", ["first"] * 32 + ["last"])
 
 def test_ocr_image_builds_data_url(tmp_path, monkeypatch):
     cap = {}

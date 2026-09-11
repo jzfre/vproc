@@ -5,11 +5,21 @@
 set -euo pipefail
 [ $# -ge 1 ] || { echo "usage: $0 \"<question>\"" >&2; exit 1; }
 URL="${VPROC_ASK_URL:-http://localhost:${VPROC_PORT:-8765}}"
-curl -sS -m 600 -X POST "$URL/ask" -H 'Content-Type: application/json' \
+RESPONSE=$(curl -sS -m 600 -X POST "$URL/ask" -H 'Content-Type: application/json' \
   -d "$(python3 -c 'import json,sys; print(json.dumps({"question": sys.argv[1]}))' "$1")" \
-| python3 -c '
+  -w '\n%{http_code}')
+printf '%s' "$RESPONSE" | python3 -c '
 import json, sys
-a = json.load(sys.stdin)
+body, _, status = sys.stdin.read().rpartition("\n")
+try:
+    a = json.loads(body)
+except json.JSONDecodeError:
+    sys.exit(f"vproc (HTTP {status}): invalid JSON response.")
+if not status.startswith("2"):
+    detail = a.get("detail") if isinstance(a, dict) else None
+    if not isinstance(detail, str):
+        detail = "Request failed."
+    sys.exit(f"vproc (HTTP {status}): {detail}")
 print("answered:", a["answered"], "| abstained:", a["abstained"])
 print(a["text"])
 for c in a.get("claims", []):

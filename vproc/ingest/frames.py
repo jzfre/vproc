@@ -15,7 +15,12 @@ def ffmpeg_sample_cmd(video: str, out_dir: str, log_path: str, scene: float = 0.
     # eq(n,0) forces the first frame through: its scene score is 0, so gt(scene,...) alone
     # drops the opening screen and emits nothing at all for a static/scene-change-free video.
     # -nostdin so a backgrounded ingest isn't stopped by SIGTTIN reading the TTY.
-    vf = f"mpdecimate,select='eq(n,0)+gt(scene,{scene})',metadata=print:file={log_path}"
+    # FFmpeg parses option values, then the filtergraph: both levels need escaping.
+    # This includes Windows drive letters/backslashes and apostrophes in user paths.
+    # subprocess receives an argv list, so there is no shell-escaping layer.
+    log_value = "".join("\\" + c if c in "\\':" else c for c in log_path)
+    log_value = "".join("\\" + c if c in "\\'[],;" else c for c in log_value)
+    vf = f"mpdecimate,select='eq(n,0)+gt(scene,{scene})',metadata=print:file={log_value}"
     return ["ffmpeg", "-hide_banner", "-nostdin", "-i", video, "-vf", vf,
             "-fps_mode", "vfr", "-frame_pts", "1", f"{out_dir}/%08d.png"]
 

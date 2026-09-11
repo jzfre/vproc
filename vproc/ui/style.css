@@ -103,6 +103,14 @@ header {
   white-space: nowrap;
 }
 
+#meeting-status {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-mid);
+  font-size: 12px;
+}
+
 select {
   appearance: none;
   -webkit-appearance: none;

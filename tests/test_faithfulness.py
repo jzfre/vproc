@@ -1,3 +1,5 @@
+import pytest
+
 from vproc.models import Evidence
 from vproc.answer.faithfulness import filter_claims
 
@@ -21,3 +23,10 @@ def test_filter_drops_when_no_premise():
     claims = [{"text": "x", "evidence_ids": ["E9"]}]  # E9 not in evidence
     kept = filter_claims(claims, {}, lambda p, h: 1.0, threshold=0.5)
     assert kept == []
+
+
+@pytest.mark.parametrize("score", [float("inf"), 1.1, True, None, "0.9"])
+def test_filter_drops_invalid_faithfulness_scores(score):
+    claims = [{"text": "ships in July", "evidence_ids": ["E1"]}]
+    by_key = {"E1": _ev("E1", "the product ships in July")}
+    assert filter_claims(claims, by_key, lambda p, h: score, threshold=0.5) == []

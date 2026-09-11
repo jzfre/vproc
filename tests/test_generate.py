@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from vproc.config import Config, Endpoint
 from vproc.answer.generate import generate, SYSTEM
 
@@ -60,3 +64,19 @@ def test_generate_strips_markdown_code_fences():
                 '"claims": [{"text": "ships in July", "evidence_ids": ["E1"]}]}\n```')
     out = generate(_cfg(), "q", "[E1] \"x\"", chat=fake_chat)
     assert out["answered"] is True and out["claims"][0]["text"] == "ships in July"
+
+
+@pytest.mark.parametrize("answered", ["false", "true", 1, [True], {"value": True}])
+def test_generate_requires_explicit_boolean_answered(answered):
+    raw = json.dumps({"answered": answered, "claims": [
+        {"text": "ships in July", "evidence_ids": ["E1"]},
+    ]})
+    out = generate(_cfg(), "q", '[E1] "ships in July"', chat=lambda *a, **k: raw)
+    assert out == {"answered": False, "claims": []}
+
+
+@pytest.mark.parametrize("text", ["", " \n\t"])
+def test_generate_drops_blank_claims(text):
+    raw = json.dumps({"answered": True, "claims": [{"text": text, "evidence_ids": ["E1"]}]})
+    out = generate(_cfg(), "q", '[E1] "ships in July"', chat=lambda *a, **k: raw)
+    assert out == {"answered": False, "claims": []}

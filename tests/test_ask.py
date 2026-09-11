@@ -1,5 +1,6 @@
 from vproc.config import Config, Endpoint
 from vproc.answer.ask import ask_memory, search_memory, ABSTAIN
+from vproc.answer.generate import generate
 
 def _cfg(sim_floor=0.25):
     ep = Endpoint("u", "m")
@@ -62,3 +63,23 @@ def test_search_memory_returns_evidence():
         return [_hit("s1", "cars")], 0.9
     ev = search_memory(None, _cfg(), "cars", _retrieve=fake_retrieve)
     assert ev[0].key == "E1" and ev[0].speaker == "Tim V"
+
+
+def test_answer_can_ground_speaker_identity_from_segment_metadata():
+    def fake_chat(base_url, model, system, user, **kwargs):
+        if "Speaker: Tim V" not in user:
+            return '{"answered": false, "claims": []}'
+        return ('{"answered": true, "claims": '
+                '[{"text": "Tim V said cars are electric now", "evidence_ids": ["E1"]}]}')
+
+    def scorer(premise, hypothesis):
+        return 0.9 if "Speaker: Tim V" in premise and "cars are electric now" in premise else 0.0
+
+    ans = ask_memory(
+        None, _cfg(), "Who said cars are electric now?", scorer=scorer,
+        _retrieve=lambda *a, **k: ([_hit("s1", "cars are electric now")], 0.9),
+        _generate=lambda cfg, question, block: generate(cfg, question, block, chat=fake_chat),
+    )
+    assert ans.answered is True
+    assert ans.claims[0].text == "Tim V said cars are electric now"
+    assert ans.claims[0].citations[0].speaker == "Tim V"

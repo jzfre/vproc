@@ -1,6 +1,7 @@
 from vproc.config import Config, Endpoint
 from vproc.store.lancedb_store import Store
 from vproc.retrieve.retriever import retrieve, rrf
+import pytest
 
 def _cfg():
     ep = Endpoint("u", "m")
@@ -18,7 +19,7 @@ def test_rrf_merges_rankings():
 def test_retrieve_returns_hits_and_top_sim(tmp_path):
     store = Store(str(tmp_path / "db.lance"))
     store.add([_row("near", [1.0, 0.0], "petrol engine cycle"),
-               _row("far", [0.0, 1.0], "hiring budget")])
+               _row("far", [0.0, 1.0], "hiring budget")], embedding_model="m")
     def fake_embed(base_url, model, texts):
         return [[1.0, 0.0]]  # query embeds near "near"
     hits, top_sim = retrieve(store, _cfg(), "engine", k=2, embed=fake_embed)
@@ -33,7 +34,7 @@ def test_retrieve_empty_store(tmp_path):
 def test_retrieve_floors_top_sim_on_fts_hit(tmp_path):
     store = Store(str(tmp_path / "db.lance"))
     store.add([_row("code", [1.0, 0.0], "quarterly rollout blocked"),
-               _row("other", [1.0, 0.1], "unrelated budget talk")])
+               _row("other", [1.0, 0.1], "unrelated budget talk")], embedding_model="m")
     # Query vector is near-orthogonal to every stored vector (vector sim < sim_floor),
     # but the token matches exactly via FTS: the fts leg must lift top_sim to sim_floor
     # so ask_memory's abstention gate cannot throw away the exact match.
@@ -44,7 +45,7 @@ def test_retrieve_floors_top_sim_on_fts_hit(tmp_path):
 
 def test_retrieve_generic_question_incidental_fts_overlap_does_not_lift_floor(tmp_path):
     store = Store(str(tmp_path / "db.lance"))
-    store.add([_row("chunk", [1.0, 0.0], "budget meeting on tuesday")])
+    store.add([_row("chunk", [1.0, 0.0], "budget meeting on tuesday")], embedding_model="m")
     # Generic question that only incidentally shares the single token 'budget' via FTS's
     # default OR match — no hit contains ALL query tokens, so the abstention floor must
     # NOT be lifted (top_sim stays at the weak vector similarity, below sim_floor).
@@ -52,3 +53,44 @@ def test_retrieve_generic_question_incidental_fts_overlap_does_not_lift_floor(tm
     hits, top_sim = retrieve(store, _cfg(), "budget forecast next quarter", k=2,
                              embed=lambda *a: [[0.1, 1.0]])
     assert top_sim < _cfg().sim_floor
+
+
+def test_retrieve_different_short_error_code_does_not_lift_floor(tmp_path):
+    store = Store(str(tmp_path / "db.lance"))
+    store.add([_row("chunk", [1.0, 0.0], "Deployment failed with ERR-99")], embedding_model="m")
+    assert store.fts_search("ERR-12", 2)
+    hits, top_sim = retrieve(store, _cfg(), "ERR-12", k=2, embed=lambda *a: [[0.0, 1.0]])
+    assert hits and top_sim < _cfg().sim_floor
+
+
+def test_retrieve_substring_overlap_does_not_lift_floor(tmp_path):
+    store = Store(str(tmp_path / "db.lance"))
+    store.add([_row("chunk", [1.0, 0.0], "discard engine prototype")], embedding_model="m")
+    assert store.fts_search("car engine", 2)
+    hits, top_sim = retrieve(store, _cfg(), "car engine", k=2, embed=lambda *a: [[0.0, 1.0]])
+    assert hits and top_sim < _cfg().sim_floor
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_retrieve_rejects_incompatible_index_before_embedding(tmp_path, legacy):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", [1.0, 0.0], "budget")],
+              embedding_model=None if legacy else "other-model")
+    def must_not_embed(*args):
+        raise AssertionError("Incompatible indexes must fail before calling the embedding model")
+    with pytest.raises(ValueError, match="VPROC_INDEX_PATH"):
+        retrieve(store, _cfg(), "budget", embed=must_not_embed)
+
+
+def test_retrieve_rejects_changed_query_embedding_dimension(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", [1.0, 0.0], "budget")], embedding_model="m")
+    with pytest.raises(ValueError, match="dimension"):
+        retrieve(store, _cfg(), "budget", embed=lambda *args: [[1.0, 0.0, 0.0]])
+
+
+@pytest.mark.parametrize("vectors", [[], [[1.0, 0.0], [1.0, 0.0]]])
+def test_retrieve_rejects_missing_or_extra_query_embeddings(tmp_path, vectors):
+    store = Store(str(tmp_path / "db"))
+    with pytest.raises(ValueError, match="embedding"):
+        retrieve(store, _cfg(), "budget", embed=lambda *args: vectors)

@@ -1,5 +1,8 @@
 import os
+import pathlib
+import shutil
 import types
+from contextlib import nullcontext
 
 import pytest
 
@@ -10,23 +13,25 @@ from vproc.ingest.transcribe import TranscriptSegment
 
 
 class FakeStore:
-    """Records add/delete instead of hitting LanceDB, so these tests don't depend on the
-    store's (concurrently-changing) delete_memory signature."""
+    """Exercise pipeline effects while real Store transactions are tested separately."""
     def __init__(self):
         self.rows = []
-        self.deletes = []
-        self.calls = []  # ordered log of add/delete so tests can assert the tail ordering
+        self.calls = []
 
-    def add(self, rows):
-        self.calls.append("add")
-        self.rows.extend(rows)
+    def write_lock(self):
+        return nullcontext()
 
-    def delete_memory(self, memory_id, project_id=None, keep_ids=None):
-        self.calls.append("delete")
-        self.deletes.append((memory_id, project_id, keep_ids))
-        keep = set(keep_ids or [])
-        self.rows = [r for r in self.rows
-                     if r["memory_id"] != memory_id or r["id"] in keep]
+    def validate_embedding_model(self, model, dimension=None):
+        pass
+
+    def memory_rows(self, memory_id, project_id=None):
+        return [r for r in self.rows if r["memory_id"] == memory_id
+                and r.get("project_id", "default") == (project_id or "default")]
+
+    def replace_memory(self, memory_id, project_id, rows, embedding_model):
+        self.calls.append("replace")
+        self.rows = [r for r in self.rows if r["memory_id"] != memory_id
+                     or r.get("project_id", "default") != project_id] + list(rows)
 
 
 def _cfg(tmp_path):
@@ -66,6 +71,7 @@ def _patch(monkeypatch, tmp_path, frames=None, transcript=None, has_audio=True):
     ts = transcript if transcript is not None else [TranscriptSegment(1.0, 3.0, "we ship in July")]
     monkeypatch.setattr(P.subprocess, "run", lambda *a, **k: None)
     monkeypatch.setattr(P, "_has_audio_stream", lambda v: has_audio)
+    monkeypatch.setattr(P, "_video_duration", lambda v: 30.0)
     monkeypatch.setattr(P, "_list_frames", lambda d: [f.path for f in frames])
     monkeypatch.setattr(P.F, "parse_frames_log", lambda text, paths: list(frames))
     monkeypatch.setattr(P.F, "phash_dedup", lambda fr, **k: list(fr))
@@ -94,8 +100,7 @@ def test_reingest_replaces_instead_of_duplicating(tmp_path, monkeypatch):
     assert len(store.rows) == 2  # prior rows replaced, not appended (would be 4)
 
 
-def test_embed_happens_before_delete(tmp_path, monkeypatch):
-    # A failed embed must NOT delete prior rows (embed-before-delete ordering).
+def test_embed_failure_preserves_existing_rows(tmp_path, monkeypatch):
     _patch(monkeypatch, tmp_path)
     store = FakeStore()
     store.rows = [{"memory_id": "standup", "id": "old"}]
@@ -107,7 +112,7 @@ def test_embed_happens_before_delete(tmp_path, monkeypatch):
         P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=store)
     except RuntimeError:
         pass
-    assert store.deletes == []  # never reached the delete
+    assert store.calls == []
     assert store.rows == [{"memory_id": "standup", "id": "old"}]  # prior rows intact
 
 
@@ -214,17 +219,13 @@ def test_has_audio_stream_raises_on_ffprobe_failure(monkeypatch):
     assert "/bad.mp4" in str(e.value) and "moov atom not found" in str(e.value)
 
 
-def test_add_before_delete_carries_new_row_ids(tmp_path, monkeypatch):
-    # store.add must run before delete_memory (a crash between them leaves recoverable
-    # duplicates, not a wiped memory), and keep_ids must be exactly the new row ids.
+def test_ingest_replaces_memory_in_one_store_operation(tmp_path, monkeypatch):
     _patch(monkeypatch, tmp_path)
     store = FakeStore()
     P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=store)
-    assert store.calls == ["add", "delete"]
-    memory_id, project_id, keep_ids = store.deletes[-1]
-    assert memory_id == "standup" and project_id == "default"
-    assert set(keep_ids) == {r["id"] for r in store.rows}
-    assert len(keep_ids) == 2  # exactly the two new rows, nothing extra kept
+    assert store.calls == ["replace"]
+    assert len(store.rows) == 2
+    assert {(r["memory_id"], r["project_id"]) for r in store.rows} == {("standup", "default")}
 
 
 def test_diarization_labels_reach_store(tmp_path, monkeypatch):
@@ -349,3 +350,256 @@ def test_naming_disabled_skips_probes(tmp_path, monkeypatch):
     cfg.diarize_model = "pyannote/fake"
     store = FakeStore()
     assert P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store) >= 1
+
+
+def test_failed_store_write_preserves_previous_frames(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path)
+    cfg = _cfg(tmp_path)
+    old_frame = tmp_path / "frames" / "default" / "standup" / "00000001.png"
+    old_frame.parent.mkdir(parents=True)
+    old_frame.write_bytes(b"previous screenshot")
+    store = FakeStore()
+    store.rows = [{"memory_id": "standup", "id": "old", "frame_path": str(old_frame)}]
+
+    def fail_replace(*args, **kwargs):
+        raise RuntimeError("index unavailable")
+
+    monkeypatch.setattr(store, "replace_memory", fail_replace)
+    with pytest.raises(RuntimeError, match="index unavailable"):
+        P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+
+    assert old_frame.read_bytes() == b"previous screenshot"
+    assert store.rows[0]["id"] == "old"
+
+
+def test_ambiguous_replacement_preserves_all_referenced_frames(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path)
+    cfg = _cfg(tmp_path)
+    old_frame = tmp_path / "frames" / "default" / "standup" / "00000001.png"
+    old_frame.parent.mkdir(parents=True)
+    old_frame.write_bytes(b"previous screenshot")
+    store = FakeStore()
+    store.rows = [{"memory_id": "standup", "id": "old", "frame_path": str(old_frame)}]
+
+    replace = store.replace_memory
+
+    def ambiguous_replace(*args, **kwargs):
+        replace(*args, **kwargs)
+        raise RuntimeError("commit acknowledgement lost")
+
+    monkeypatch.setattr(store, "replace_memory", ambiguous_replace)
+    with pytest.raises(RuntimeError, match="acknowledgement lost"):
+        P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+
+    assert old_frame.read_bytes() == b"previous screenshot"
+    assert all(os.path.isfile(row["frame_path"]) for row in store.rows)
+    assert len({row["frame_path"] for row in store.rows}) == len(store.rows)
+
+
+def test_reingest_keeps_unrelated_frames_in_shared_storage(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path)
+    cfg = _cfg(tmp_path)
+    unrelated = tmp_path / "frames" / "default" / "standup" / "other-index.png"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_bytes(b"another index still references this")
+
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=FakeStore())
+
+    assert unrelated.read_bytes() == b"another index still references this"
+
+
+def test_busy_frame_storage_stops_ingest_before_model_calls(tmp_path, monkeypatch):
+    from vproc.errors import IndexBusyError
+    from vproc.locking import IndexWriteLock
+
+    _patch(monkeypatch, tmp_path)
+    cfg = _cfg(tmp_path)
+    store = FakeStore()
+
+    def unexpected_probe(*args):
+        pytest.fail("an overlapping ingest must be rejected before probing or inference")
+
+    monkeypatch.setattr(P, "_video_duration", unexpected_probe)
+    with IndexWriteLock(cfg.frames_dir, name=".vproc-frames.lock"):
+        with pytest.raises(IndexBusyError):
+            P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    assert store.calls == []
+
+
+def test_index_and_frames_can_share_a_directory(tmp_path, monkeypatch):
+    from vproc.store.lancedb_store import Store
+
+    _patch(monkeypatch, tmp_path)
+    cfg = _cfg(tmp_path)
+    cfg.index_path = cfg.frames_dir
+    store = Store(cfg.index_path)
+    assert P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store) == 2
+    assert len(store.memory_rows("standup", "default")) == 2
+
+
+def test_incompatible_model_stops_ingest_before_extraction(tmp_path, monkeypatch):
+    from vproc.errors import IndexCompatibilityError
+
+    _patch(monkeypatch, tmp_path)
+    store = FakeStore()
+
+    def incompatible(*args):
+        raise IndexCompatibilityError("embedding model mismatch")
+
+    monkeypatch.setattr(store, "validate_embedding_model", incompatible)
+    with pytest.raises(IndexCompatibilityError, match="mismatch"):
+        P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=store)
+    assert store.calls == []
+
+
+def test_symlinked_memory_directory_cannot_redirect_ingest_writes(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path)
+    cfg = _cfg(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    project = tmp_path / "frames" / "default"
+    project.mkdir(parents=True)
+    (project / "standup").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="directory"):
+        P.ingest_video("/videos/standup.mp4", cfg=cfg, store=FakeStore())
+    assert list(outside.iterdir()) == []
+
+
+def test_empty_reingest_preserves_previous_memory(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path, transcript=[], has_audio=False)
+    monkeypatch.setattr(P.O, "ocr_frame", lambda *args: "")
+    cfg = _cfg(tmp_path)
+    old_frame = tmp_path / "frames" / "default" / "standup" / "previous.png"
+    old_frame.parent.mkdir(parents=True)
+    old_frame.write_bytes(b"previous screenshot")
+    store = FakeStore()
+    store.rows = [{"memory_id": "standup", "id": "old", "frame_path": str(old_frame)}]
+
+    assert P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store) == 0
+
+    assert store.calls == []
+    assert store.rows[0]["id"] == "old"
+    assert old_frame.read_bytes() == b"previous screenshot"
+
+
+def test_relative_media_paths_are_persisted_as_absolute(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _patch(monkeypatch, tmp_path)
+    cfg = _cfg(tmp_path)
+    cfg.frames_dir = "frames"
+    store = FakeStore()
+
+    P.ingest_video("videos/standup.mp4", cfg=cfg, store=store)
+
+    assert {row["source_video"] for row in store.rows} == {str(tmp_path / "videos" / "standup.mp4")}
+    assert all(os.path.isabs(row["frame_path"]) for row in store.rows)
+
+
+@pytest.mark.parametrize("project_id", ["", ".", "..", "../other", "/tmp/elsewhere", "a/b", "a\\b"])
+def test_invalid_project_id_cannot_write_outside_memory_dir(tmp_path, monkeypatch, project_id):
+    _patch(monkeypatch, tmp_path)
+    store = FakeStore()
+    if os.path.isabs(project_id):
+        project_id = str(tmp_path / "outside-project")
+
+    with pytest.raises(ValueError, match="project"):
+        P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=store,
+                       project_id=project_id)
+
+    assert store.calls == []
+
+
+@pytest.mark.parametrize("video_path", ["/videos/..", "/"])
+def test_invalid_memory_title_is_rejected(tmp_path, monkeypatch, video_path):
+    _patch(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match="memory"):
+        P.ingest_video(video_path, cfg=_cfg(tmp_path), store=FakeStore())
+
+
+def test_static_silent_video_covers_full_media_duration(tmp_path, monkeypatch):
+    frames = [RawFrame(_src_frame(tmp_path, "opening.png"), 0.0)]
+    _patch(monkeypatch, tmp_path, frames=frames, transcript=[], has_audio=False)
+    monkeypatch.setattr(P, "_video_duration", lambda v: 120.5)
+    store = FakeStore()
+
+    P.ingest_video("/videos/slide.mp4", cfg=_cfg(tmp_path), store=store)
+
+    assert [(row["start_ts"], row["end_ts"]) for row in store.rows] == [(0.0, 120.5)]
+
+
+def test_successful_reingest_removes_previous_screenshots(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path)
+    store = FakeStore()
+    cfg = _cfg(tmp_path)
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    previous_paths = {row["frame_path"] for row in store.rows}
+
+    _patch(monkeypatch, tmp_path)
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+
+    assert all(os.path.exists(row["frame_path"]) for row in store.rows)
+    assert all(not os.path.exists(path) for path in previous_paths)
+
+
+@pytest.mark.parametrize("output", ["N/A", "nan", "inf", "-1"])
+def test_video_duration_rejects_unknown_or_invalid_duration(monkeypatch, output):
+    monkeypatch.setattr(P.subprocess, "run", lambda *args, **kwargs:
+                        types.SimpleNamespace(returncode=0, stdout=output, stderr=""))
+    with pytest.raises(RuntimeError, match="duration"):
+        P._video_duration("/videos/clip.mp4")
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+                    reason="ffmpeg and ffprobe are required for media integration")
+def test_real_silent_video_ingest_and_replacement(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from PIL import Image
+    from vproc.ingest.embed_index import embed_rows
+    from vproc.service import create_app
+    from vproc.store.lancedb_store import Store
+
+    video = tmp_path / "slides.mp4"
+    P.subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+         "-f", "lavfi", "-i", "color=c=blue:s=64x64:r=10:d=2.5",
+         "-c:v", "mpeg4", str(video)], check=True,
+    )
+    monkeypatch.setattr(P.O, "ocr_frame", lambda *args: "Agenda")
+    monkeypatch.setattr(P.EI, "embed_rows", lambda cfg, segments:
+                        embed_rows(cfg, segments, embed=lambda *args: [[1.0, 0.0]] * len(segments)))
+    cfg = _cfg(tmp_path)
+    store = Store(cfg.index_path)
+
+    assert P.ingest_video(str(video), cfg=cfg, store=store) == 1
+    first = store.memory_rows("slides", "default")[0]
+    assert first["start_ts"] == 0.0
+    assert first["end_ts"] == pytest.approx(2.5)
+    assert first["source_video"] == str(video)
+    assert first["said_text"] == ""
+    assert first["on_screen_text"] == "Agenda"
+    with Image.open(first["frame_path"]) as frame:
+        assert frame.size == (64, 64)
+
+    client = TestClient(create_app(store=store, cfg=cfg, scorer=lambda p, h: 1.0))
+    assert client.get("/api/memories").json()[0]["duration_s"] == pytest.approx(2.5)
+    old_name = client.get("/api/memories/slides/segments").json()[0]["frame_name"]
+    assert client.get(f"/api/frames/slides/{old_name}").content == pathlib.Path(first["frame_path"]).read_bytes()
+    partial = client.get("/api/media/slides", headers={"Range": "bytes=0-7"})
+    assert partial.status_code == 206
+    assert partial.content == video.read_bytes()[:8]
+
+    # A same-stem re-ingest from a new source directory must update this running app.
+    replacement = tmp_path / "replacement" / video.name
+    replacement.parent.mkdir()
+    shutil.copyfile(video, replacement)
+    assert P.ingest_video(str(replacement), cfg=cfg, store=store) == 1
+    video.unlink()
+    rows = store.memory_rows("slides", "default")
+    assert len(rows) == 1
+    assert rows[0]["frame_path"] != first["frame_path"]
+    assert os.path.isfile(rows[0]["frame_path"])
+    assert not os.path.exists(first["frame_path"])
+    assert client.get("/api/media/slides").content == replacement.read_bytes()
+    new_name = client.get("/api/memories/slides/segments").json()[0]["frame_name"]
+    assert client.get(f"/api/frames/slides/{new_name}").status_code == 200
+    assert client.get(f"/api/frames/slides/{old_name}").status_code == 404

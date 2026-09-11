@@ -2,6 +2,7 @@ from vproc.config import Config, Endpoint
 from vproc.models import Segment
 from vproc.store.lancedb_store import Store
 from vproc.ingest.embed_index import embed_and_store, embed_rows
+import pytest
 
 def _cfg():
     ep = Endpoint("u", "m")
@@ -38,3 +39,37 @@ def test_embed_rows_empty_does_not_call_embed():
     called = {"n": 0}
     assert embed_rows(_cfg(), [], embed=lambda *a: called.__setitem__("n", called["n"] + 1)) == []
     assert called["n"] == 0
+
+
+@pytest.mark.parametrize("vectors", [[], [[1.0, 0.0]], [[1.0, 0.0]] * 3])
+def test_embed_rows_rejects_missing_or_extra_embeddings(vectors):
+    with pytest.raises(ValueError, match="embedding"):
+        embed_rows(_cfg(), [_seg(1), _seg(2)], embed=lambda *args: vectors)
+
+
+def test_embed_and_store_records_configured_embedding_model(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    embed_and_store(_cfg(), store, [_seg(1)], embed=lambda *args: [[1.0, 0.0]])
+    store.validate_embedding_model("m", dimension=2)
+    with pytest.raises(ValueError, match="model"):
+        store.validate_embedding_model("different-model")
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_embed_and_store_rejects_incompatible_index_before_embedding(tmp_path, legacy):
+    store = Store(str(tmp_path / "db"))
+    rows = embed_rows(_cfg(), [_seg(1)], embed=lambda *args: [[1.0, 0.0]])
+    store.add(rows, embedding_model=None if legacy else "different-model")
+    def must_not_embed(*args):
+        raise AssertionError("Incompatible indexes must fail before calling the embedding model")
+    with pytest.raises(ValueError, match="VPROC_INDEX_PATH"):
+        embed_and_store(_cfg(), store, [_seg(2)], embed=must_not_embed)
+    assert [row["id"] for row in store.all_rows()] == ["s1"]
+
+
+def test_embed_and_store_rejects_dimension_change_without_adding_rows(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    embed_and_store(_cfg(), store, [_seg(1)], embed=lambda *args: [[1.0, 0.0]])
+    with pytest.raises(ValueError, match="dimension"):
+        embed_and_store(_cfg(), store, [_seg(2)], embed=lambda *args: [[1.0, 0.0, 0.0]])
+    assert [row["id"] for row in store.all_rows()] == ["s1"]

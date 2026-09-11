@@ -48,3 +48,30 @@ def test_phash_dedup_floor_forces_anchor(tmp_path):
     frames = [RawFrame(a, 0.0), RawFrame(a2, 40.0)]  # identical but 40s apart
     kept = phash_dedup(frames, threshold=6, floor_s=30)
     assert [f.path for f in kept] == [a, a2]
+
+
+def test_ffmpeg_writes_metadata_in_directory_with_filter_special_characters(tmp_path):
+    import os
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg is required for the path-escaping integration check")
+    # An apostrophe is legal on Windows; on POSIX also exercise colon (drive separator),
+    # backslash and filtergraph delimiters using a real filesystem path.
+    dirname = "owner's recordings [1],part;2" if os.name == "nt" else "C:\\owner's [1],part;2"
+    work = tmp_path / dirname
+    work.mkdir()
+    source = work / "source.png"
+    Image.new("RGB", (64, 64), "blue").save(source)
+    out = work / "frames"
+    out.mkdir()
+    log = work / "frames.log"
+    result = subprocess.run(ffmpeg_sample_cmd(str(source), str(out), str(log)),
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    frames = parse_frames_log(log.read_text(), [str(p) for p in out.glob("*.png")])
+    assert len(frames) == 1
+    assert frames[0].t == 0.0

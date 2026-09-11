@@ -2,30 +2,36 @@
 name = "vproc"
 version = "0.1.0"
 description = "Grounded meeting-memory from video"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "openai>=1.40",
-    "lancedb>=0.13",
+    "lancedb>=0.33",
     "pyarrow>=17",
     "pydantic>=2.7",
     "pillow>=10",
     "imagehash>=4.3",
     "fastapi>=0.115",
     "uvicorn>=0.30",
-    "mcp>=1.27",
+    # SDK v2 removes mcp.server.fastmcp, which this service uses.
+    "mcp>=1.27,<2",
     "numpy>=1.26",
-    "pyannote-audio>=4.0",
+    "filelock>=3.15",
 ]
 
 [project.optional-dependencies]
-# Heavy real-model deps — needed only for real ingest/answering (Task 18), NOT for the
-# offline unit tests (which inject fakes; transformers/mlx-whisper are imported lazily).
+# Model libraries are optional; the server and remote-endpoint ingest work without them.
+answer = ["transformers>=4.51,<5", "torch>=2.4"]
+diarization = ["pyannote-audio>=4.0"]
+local-asr = ["mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+# Convenience install for all supported local model features.
 runtime = [
     # HHEM's trust_remote_code model (modeling_hhem_v2.py) targets the transformers 4.x
     # API; 5.x renamed internals (all_tied_weights_keys) and breaks model load. Cap <5.
     "transformers>=4.51,<5",
     "torch>=2.4",
-    "mlx-whisper>=0.4; sys_platform == 'darwin'",
+    "pyannote-audio>=4.0",
+    "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.scripts]
@@ -37,6 +43,25 @@ dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.6"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vproc"]
+
+[tool.hatch.build.targets.sdist]
+# Explicit release contents: never bundle local recordings, indexes, caches, or secrets.
+include = [
+    "/vproc",
+    "/tests",
+    "/scripts",
+    "/docs/brain",
+    "/docs/works",
+    "/README.md",
+    "/pyproject.toml",
+    "/uv.lock",
+]
+
+[tool.hatch.build.targets.sdist.force-include]
+".env.example" = ".env.example"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

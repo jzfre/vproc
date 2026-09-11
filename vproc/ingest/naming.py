@@ -145,9 +145,20 @@ def sample_name_votes(video_path: str, turns: list[SpeakerTurn], cfg, probe=None
 
 
 def save_speaker_map(mem_dir: str, data: dict) -> None:
+    payload = json.dumps(data, indent=1)
     os.makedirs(mem_dir, exist_ok=True)
-    with open(os.path.join(mem_dir, "speakers.json"), "w") as f:
-        json.dump(data, f, indent=1)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=mem_dir, prefix=".speakers-",
+                                         suffix=".json", delete=False) as f:
+            temporary = f.name
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, os.path.join(mem_dir, "speakers.json"))
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def load_speaker_map(mem_dir: str) -> dict:

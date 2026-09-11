@@ -148,3 +148,15 @@ def test_speaker_map_round_trip(tmp_path):
     N.save_speaker_map(mem_dir, data)
     assert N.load_speaker_map(mem_dir) == data
     assert os.path.exists(os.path.join(mem_dir, "speakers.json"))
+
+
+def test_failed_speaker_map_save_preserves_previous_file(tmp_path):
+    from vproc.ingest.naming import load_speaker_map, save_speaker_map
+    import pytest
+
+    previous = {"mapping": {"SPEAKER_00": "Ada"}, "suggestions": {}, "votes": []}
+    save_speaker_map(str(tmp_path), previous)
+    with pytest.raises(TypeError):
+        save_speaker_map(str(tmp_path), {"mapping": {"not JSON serializable"}})
+    assert load_speaker_map(str(tmp_path)) == previous
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["speakers.json"]

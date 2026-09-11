@@ -1,5 +1,5 @@
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from vproc.ingest.frames import RawFrame
 from vproc.ingest.transcribe import TranscriptSegment

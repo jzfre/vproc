@@ -10,6 +10,7 @@
 <header>
   <div class="brand"><span class="brand-led" aria-hidden="true"></span><span class="brand-word">vproc</span></div>
   <select id="memory-picker" aria-label="Meeting"></select>
+  <span id="meeting-status" role="status"></span>
   <span id="meeting-meta" class="meta"></span>
 </header>
 <main>
@@ -29,7 +30,7 @@
       <option value="ask">ask</option>
       <option value="search">search</option>
     </select>
-    <input id="qa-input" placeholder="Ask this meeting…" autocomplete="off">
+    <input id="qa-input" placeholder="Ask across all meetings…" aria-label="Question or search across all meetings" autocomplete="off">
     <button id="qa-go" type="button">Go</button>
     <span id="qa-spinner" hidden aria-hidden="true"></span>
   </div>

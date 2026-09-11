@@ -56,11 +56,13 @@ def generate(cfg, question: str, evidence_block: str, chat=client.chat_json) -> 
                        schema=ANSWER_SCHEMA, max_tokens=cfg.grounding_max_tokens,
                        think=cfg.grounding_thinking))
     data = data if isinstance(data, dict) else {}
+    if data.get("answered") is not True:
+        return {"answered": False, "claims": []}
     raw_claims = data.get("claims")
     claims = [
         c for c in (raw_claims if isinstance(raw_claims, list) else [])
-        if isinstance(c, dict) and isinstance(c.get("text"), str)
+        if isinstance(c, dict) and isinstance(c.get("text"), str) and c["text"].strip()
         and isinstance(c.get("evidence_ids"), list)
         and c["evidence_ids"] and all(isinstance(e, str) for e in c["evidence_ids"])
     ]
-    return {"answered": bool(data.get("answered")) and len(claims) > 0, "claims": claims}
+    return {"answered": bool(claims), "claims": claims}

@@ -1,3 +1,4 @@
+from vproc.answer.evidence import evidence_text
 from vproc.models import Evidence
 
 HHEM_MODEL = "vectara/hallucination_evaluation_model"
@@ -22,8 +23,12 @@ def filter_claims(claims: list[dict], evidence_by_key: dict[str, Evidence],
     kept: list[dict] = []
     for claim in claims:
         premise = "\n".join(
-            evidence_by_key[k].text for k in claim["evidence_ids"] if k in evidence_by_key
+            evidence_text(evidence_by_key[k]) for k in claim["evidence_ids"] if k in evidence_by_key
         )
-        if premise and scorer(premise, claim["text"]) >= threshold:
+        if not premise:
+            continue
+        score = scorer(premise, claim["text"])
+        # A score must be a probability; invalid model output cannot verify a claim.
+        if type(score) in (int, float) and 0.0 <= score <= 1.0 and score >= threshold:
             kept.append(claim)
     return kept

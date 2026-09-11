@@ -14,4 +14,5 @@ def test_build_evidence_assigns_sequential_keys():
 def test_evidence_block_format():
     ev = build_evidence([_hit("s1", "hello world")])
     block = evidence_block(ev)
-    assert block == '[E1] "hello world"'
+    assert block == ('[E1] "Meeting: standup\nSpeaker: Tim V\n'
+                     'Time: 00:12-00:14\nhello world"')

@@ -1,7 +1,11 @@
 import dataclasses
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
+from openai import APIConnectionError, APIStatusError, APITimeoutError
 from vproc.config import Config, Endpoint
+from vproc.errors import IndexBusyError, IndexCompatibilityError
 from vproc.models import Answer
 from vproc.service import create_app
 
@@ -278,13 +282,12 @@ def test_api_frames_traversal_payloads_that_reach_the_guard(tmp_path):
 
 
 def test_missing_ui_dir_does_not_crash_app_creation(tmp_path, monkeypatch):
-    # check_dir=False on the static mount: create_app() must not raise even when
-    # vproc/ui doesn't exist (e.g. a stripped install), and the real API routes —
-    # registered before the mount — keep working regardless.
+    # An API-only install must keep working and return a normal 404 for the UI.
     import vproc.service as svc
     monkeypatch.setattr(svc, "__file__", str(tmp_path / "service.py"))
     app = create_app(store=_UIStore([]), scorer=lambda p, h: 1.0, cfg=_cfg())
     assert TestClient(app).get("/healthz").json() == {"ok": True}
+    assert TestClient(app).get("/").status_code == 404
 
 
 def test_root_serves_ui_and_api_wins():
@@ -293,3 +296,180 @@ def test_root_serves_ui_and_api_wins():
     r = c.get("/")
     assert r.status_code == 200 and "text/html" in r.headers["content-type"]
     assert c.get("/healthz").json() == {"ok": True}  # routes still beat the mount
+
+
+def test_browsing_and_search_do_not_load_answer_verifier(monkeypatch):
+    import vproc.answer.faithfulness as faithfulness
+
+    def unavailable_model(*args):
+        raise AssertionError("Browsing must not load or download the answer model")
+
+    monkeypatch.setattr(faithfulness, "HHEM", unavailable_model)
+    app = create_app(store=_UIStore([]), cfg=_cfg(), search=lambda *a, **k: [])
+    with TestClient(app) as client:
+        assert client.get("/").status_code == 200
+        assert client.get("/healthz").json() == {"ok": True}
+        assert client.get("/api/memories").json() == []
+        assert client.post("/search", json={"query": "release"}).json() == []
+
+
+def test_answer_verifier_loads_on_first_score_and_is_reused(monkeypatch):
+    import vproc.answer.faithfulness as faithfulness
+
+    loaded = []
+
+    class Verifier:
+        def __init__(self, model):
+            loaded.append(model)
+
+        def score(self, premise, hypothesis):
+            return 0.8
+
+    def answer_with_score(store, cfg, question, scorer, where=None):
+        return Answer(answered=True, abstained=False,
+                      text=str(scorer("evidence", question)), claims=[], evidence=[])
+
+    monkeypatch.setattr(faithfulness, "HHEM", Verifier)
+    app = create_app(store=_UIStore([]), cfg=_cfg(), ask=answer_with_score)
+    assert loaded == []
+    with TestClient(app) as client:
+        for question in ("first", "second"):
+            assert client.post("/ask", json={"question": question}).json()["text"] == "0.8"
+    assert loaded == [_cfg().hhem_model]
+
+
+def test_media_uses_updated_index_after_reingest(tmp_path):
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"old recording")
+    second.write_bytes(b"new recording")
+    store = _UIStore([{**_ui_rows()[0], "source_video": str(first)}])
+    client = TestClient(create_app(store=store, cfg=_cfg(), scorer=lambda p, h: 1.0))
+    assert client.get("/api/media/standup").content == b"old recording"
+    store.rows[0]["source_video"] = str(second)
+    assert client.get("/api/media/standup").content == b"new recording"
+    store.rows.clear()
+    assert client.get("/api/media/standup").status_code == 404
+
+
+def test_media_directory_is_reported_as_missing(tmp_path):
+    store = _UIStore([{**_ui_rows()[0], "source_video": str(tmp_path)}])
+    client = TestClient(create_app(store=store, cfg=_cfg(), scorer=lambda p, h: 1.0))
+    assert client.get("/api/media/standup").status_code == 404
+
+
+def test_frame_symlink_cannot_escape_frames_directory(tmp_path):
+    frames = tmp_path / "frames" / "default" / "standup"
+    frames.mkdir(parents=True)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"outside frame storage")
+    (frames / "00000001.png").symlink_to(outside)
+    cfg = _cfg_with(_cfg(), frames_dir=str(tmp_path / "frames"))
+    client = TestClient(create_app(store=_UIStore([]), cfg=cfg, scorer=lambda p, h: 1.0))
+    assert client.get("/api/frames/standup/00000001.png").status_code == 404
+
+
+@pytest.mark.parametrize("route, field", [("/ask", "question"), ("/search", "query")])
+def test_query_length_limit_rejects_before_backend_and_allows_boundary(route, field):
+    def answer(store, cfg, question, scorer, where=None):
+        assert len(question) <= 8192, "overlong input reached backend"
+        return Answer(answered=False, abstained=True, text="offline", claims=[], evidence=[])
+
+    def search(store, cfg, query, where=None):
+        assert len(query) <= 8192, "overlong input reached backend"
+        return []
+
+    client = TestClient(create_app(store=object(), cfg=_cfg(), scorer=lambda *_: 1,
+                                   ask=answer, search=search))
+    assert client.post(route, json={field: "x" * 8193}).status_code == 400
+    assert client.post(route, json={field: "x" * 8192}).status_code == 200
+
+
+@pytest.mark.parametrize("field", ["project", "memory", "speaker"])
+@pytest.mark.parametrize("value", ["x\x00y", "x\x85y", "x" * 129])
+def test_search_filter_validation_blocks_invalid_values(field, value):
+    def search(*args, **kwargs):
+        pytest.fail("invalid filter reached the retrieval backend")
+
+    client = TestClient(create_app(store=object(), cfg=_cfg(), scorer=lambda *_: 1,
+                                   search=search))
+    assert client.post("/search", json={"query": "q", field: value}).status_code == 400
+
+
+def _backend_errors():
+    request = httpx.Request("POST", "http://backend.invalid/v1", headers={"Authorization": "secret-token"})
+    return [
+        (APITimeoutError(request=request), 504, "timed out"),
+        (APIConnectionError(message="secret-token connection body", request=request), 503, "unavailable"),
+        (APIStatusError("secret-token response body", response=httpx.Response(503, request=request),
+                        body={"secret": "secret-token"}), 503, "unavailable"),
+        (RuntimeError("secret-token unexpected backend response"), 500, "failed"),
+        (IndexCompatibilityError("secret-token index metadata"), 409, "re-ingest"),
+        (IndexBusyError("secret-token index path"), 503, "retry"),
+    ]
+
+
+@pytest.mark.parametrize("route, field", [("/ask", "question"), ("/search", "query")])
+@pytest.mark.parametrize("error, status, detail", _backend_errors())
+def test_backend_failures_are_safe_and_next_request_recovers(route, field, error, status, detail, caplog):
+    pending_error = error
+
+    def backend(*args, **kwargs):
+        nonlocal pending_error
+        if pending_error is not None:
+            exc, pending_error = pending_error, None
+            raise exc
+        return (Answer(answered=False, abstained=True, text="recovered", claims=[], evidence=[])
+                if route == "/ask" else [])
+
+    app = create_app(store=object(), cfg=_cfg(), scorer=lambda *_: 1, ask=backend, search=backend)
+    with TestClient(app) as client:
+        response = client.post(route, json={field: "release?"})
+        assert response.status_code == status
+        assert detail in response.json()["detail"].lower()
+        assert "secret-token" not in response.text
+        assert client.get("/healthz").json() == {"ok": True}
+        assert client.post(route, json={field: "release?"}).status_code == 200
+    assert "secret-token" not in caplog.text
+
+
+def test_mcp_setup_failure_is_visible_without_breaking_rest(monkeypatch, caplog):
+    from mcp.server.fastmcp import FastMCP
+
+    def broken_setup(self):
+        raise RuntimeError("secret-token setup details")
+
+    monkeypatch.setattr(FastMCP, "streamable_http_app", broken_setup)
+    client = TestClient(create_app(store=object(), cfg=_cfg(), scorer=lambda *_: 1,
+                                   search=lambda *a, **k: []))
+    assert client.get("/healthz").json() == {"ok": True}
+    assert client.post("/search", json={"query": "release"}).status_code == 200
+    status = client.get("/api/status")
+    assert status.status_code == 200
+    assert status.json()["mcp_available"] is False
+    assert "MCP" in caplog.text and "unavailable" in caplog.text.lower()
+    assert "secret-token" not in status.text + caplog.text
+
+
+def test_status_checks_empty_and_legacy_index_without_model_calls(tmp_path, monkeypatch):
+    from vproc.llm import client as llm
+    from vproc.store.lancedb_store import Store
+
+    def no_model_calls(*args, **kwargs):
+        pytest.fail("index status must not probe model endpoints")
+
+    monkeypatch.setattr(llm, "_client", no_model_calls)
+    store = Store(str(tmp_path / "index"))
+    client = TestClient(create_app(store=store, cfg=_cfg(), scorer=lambda *_: 1))
+    status = client.get("/api/status")
+    assert status.status_code == 200
+    assert status.json()["mcp_available"] is True
+    assert status.json()["index_compatible"] is True
+
+    store.db.create_table(store.TABLE, data=[{**_ui_rows()[0], "vector": [1.0, 0.0]}])
+    status = client.get("/api/status")
+    assert status.status_code == 200
+    assert status.json()["index_compatible"] is False
+    assert "re-ingest" in status.json()["detail"].lower()
+    assert client.get("/healthz").json() == {"ok": True}
+    assert client.get("/api/memories").status_code == 200

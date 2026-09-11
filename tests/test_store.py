@@ -1,4 +1,5 @@
 from vproc.store.lancedb_store import Store
+import pytest
 
 def _row(id, project, vec, text="x"):
     return {"id": id, "project_id": project, "memory_id": "m", "speaker": "SPEAKER_0",
@@ -163,3 +164,233 @@ def test_all_rows_strips_vector(tmp_path):
     rows = store.all_rows()
     assert len(rows) == 1 and "vector" not in rows[0]
     assert Store(str(tmp_path / "empty")).all_rows() == []
+
+
+def test_metadata_queries_return_all_matching_rows_and_escape_filters(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    rows = [
+        {**_row(str(i), "owner's project", [1.0, 0.0]), "memory_id": "Tim's meeting"}
+        for i in range(25)
+    ]
+    rows.append(_row("other", "other project", [0.0, 1.0]))
+    store.add(rows)
+    selected = store.memory_rows("Tim's meeting", "owner's project")
+    assert {r["id"] for r in selected} == {str(i) for i in range(25)}
+    assert all("vector" not in r for r in selected)
+    assert len(store.all_rows()) == 26
+    assert store.memory_rows("' OR true OR memory_id = '") == []
+    assert store.memory_rows("Tim's meeting", "' OR true OR project_id = '") == []
+
+
+def test_embedding_identity_persists_and_rejects_same_dimension_model_change(tmp_path):
+    path = str(tmp_path / "db")
+    store = Store(path)
+    store.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
+    reopened = Store(path)
+    reopened.validate_embedding_model("model-a", dimension=2)
+    with pytest.raises(ValueError, match="VPROC_INDEX_PATH"):
+        reopened.validate_embedding_model("model-b", dimension=2)
+    with pytest.raises(ValueError, match="VPROC_INDEX_PATH"):
+        reopened.add([_row("new", "p", [1.0, 0.0])], embedding_model="model-b")
+    assert [row["id"] for row in reopened.all_rows()] == ["old"]
+
+
+def test_legacy_index_allows_metadata_but_rejects_model_dependent_work(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("legacy", "p", [1.0, 0.0])])
+    with pytest.raises(ValueError, match="re-ingest"):
+        store.validate_embedding_model("model-a")
+    with pytest.raises(ValueError, match="re-ingest"):
+        store.vector_search([1.0, 0.0], 1, embedding_model="model-a")
+    with pytest.raises(ValueError, match="re-ingest"):
+        store.add([_row("new", "p", [1.0, 0.0])], embedding_model="model-a")
+    assert [row["id"] for row in store.memory_rows("m", "p")] == ["legacy"]
+    assert len(store.all_rows()) == 1
+
+
+def test_known_index_rejects_unidentified_writes_and_wrong_dimensions(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
+    with pytest.raises(ValueError, match="model"):
+        store.add([_row("unknown", "p", [1.0, 0.0])])
+    with pytest.raises(ValueError, match="dimension"):
+        store.add([_row("wide", "p", [1.0, 0.0, 0.0])], embedding_model="model-a")
+    with pytest.raises(ValueError, match="dimension"):
+        store.vector_search([1.0, 0.0, 0.0], 1, embedding_model="model-a")
+    assert [row["id"] for row in store.all_rows()] == ["old"]
+
+
+@pytest.mark.parametrize("metadata", [
+    {b"vproc:embedding_model": b"model-a"},
+    {b"vproc:embedding_dimension": b"2"},
+    {b"vproc:embedding_model": b"", b"vproc:embedding_dimension": b"2"},
+    {b"vproc:embedding_model": b" ", b"vproc:embedding_dimension": b"2"},
+    {b"vproc:embedding_model": b"model-a", b"vproc:embedding_dimension": b"-2"},
+    {b"vproc:embedding_model": b"model-a", b"vproc:embedding_dimension": b"3"},
+])
+def test_malformed_embedding_metadata_does_not_get_adopted(tmp_path, metadata):
+    import pyarrow as pa
+
+    store = Store(str(tmp_path / "db"))
+    schema = pa.Table.from_pylist([_row("old", "p", [1.0, 0.0])]).schema
+    i = schema.get_field_index("vector")
+    schema = schema.set(i, pa.field("vector", pa.list_(pa.float32(), 2)))
+    store.db.create_table(store.TABLE, [_row("old", "p", [1.0, 0.0])],
+                          schema=schema.with_metadata(metadata))
+    with pytest.raises(ValueError, match="metadata"):
+        store.validate_embedding_model("model-a")
+    assert [row["id"] for row in store.all_rows()] == ["old"]
+
+
+def test_replace_memory_commits_one_scoped_row_change(tmp_path, monkeypatch):
+    from lancedb.table import LanceTable
+
+    # Isolate the row transaction from optional FTS index commits.
+    monkeypatch.setattr(LanceTable, "create_fts_index", lambda *args, **kwargs: None)
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("same", "owner's project", [1.0, 0.0], "old"),
+               _row("stale", "owner's project", [1.0, 0.0]),
+               _row("other-project", "other", [1.0, 0.0]),
+               {**_row("other-memory", "owner's project", [1.0, 0.0]), "memory_id": "keep"}],
+              embedding_model="model-a")
+    before = store._table().version
+    store.replace_memory("m", "owner's project", [
+        _row("same", "owner's project", [0.0, 1.0], "updated"),
+        _row("new", "owner's project", [0.0, 1.0]),
+    ], embedding_model="model-a")
+    assert store._table().version == before + 1
+    rows = {row["id"]: row for row in store.all_rows()}
+    assert set(rows) == {"same", "new", "other-project", "other-memory"}
+    assert rows["same"]["said_text"] == "updated"
+    store.validate_embedding_model("model-a", dimension=2)
+
+
+def test_failed_lance_replacement_preserves_old_rows_and_version(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
+    before = store._table().version
+    # This reaches Lance's real schema conversion; no mutation may precede it.
+    bad = {**_row("new", "p", [1.0, 0.0]), "start_ts": "not a number"}
+    with pytest.raises((ValueError, TypeError, RuntimeError)):
+        store.replace_memory("m", "p", [bad], embedding_model="model-a")
+    reopened = Store(str(tmp_path / "db"))
+    assert reopened._table().version == before
+    assert [row["id"] for row in reopened.all_rows()] == ["old"]
+
+
+@pytest.mark.parametrize("rows", [
+    [],
+    [_row("new", "wrong-project", [1.0, 0.0])],
+    [{**_row("new", "p", [1.0, 0.0]), "memory_id": "wrong-memory"}],
+    [_row("new", "p", [1.0, 0.0]), _row("new", "p", [1.0, 0.0])],
+    [_row("", "p", [1.0, 0.0])],
+    [_row("new", "p", [])],
+    [_row("new", "p", [float("nan"), 0.0])],
+    [_row("new", "p", [float("inf"), 0.0])],
+])
+def test_replace_memory_rejects_invalid_rows_without_touching_previous_data(tmp_path, rows):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
+    before = store._table().version
+    with pytest.raises(ValueError):
+        store.replace_memory("m", "p", rows, embedding_model="model-a")
+    assert store._table().version == before
+    assert [row["id"] for row in store.all_rows()] == ["old"]
+
+
+def test_replace_memory_rejects_cross_scope_id_collision(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", "p", [1.0, 0.0]), _row("taken", "other", [1.0, 0.0])],
+              embedding_model="model-a")
+    before = store._table().version
+    with pytest.raises(ValueError, match="id"):
+        store.replace_memory("m", "p", [_row("taken", "p", [1.0, 0.0])], "model-a")
+    assert store._table().version == before
+    assert {row["id"] for row in store.all_rows()} == {"old", "taken"}
+
+
+def test_replace_memory_on_new_store_records_identity(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.replace_memory("m", "p", [_row("new", "p", [1.0, 0.0])], "model-a")
+    store.validate_embedding_model("model-a", dimension=2)
+    assert [row["id"] for row in store.all_rows()] == ["new"]
+
+
+def test_fts_rebuild_failure_does_not_report_committed_replacement_as_failed(tmp_path, monkeypatch, caplog):
+    from lancedb.table import LanceTable
+
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
+    def fail_fts(*args, **kwargs):
+        raise RuntimeError("could contain transcript content")
+    monkeypatch.setattr(LanceTable, "create_fts_index", fail_fts)
+    store.replace_memory("m", "p", [_row("new", "p", [1.0, 0.0])], "model-a")
+    assert [row["id"] for row in store.all_rows()] == ["new"]
+    assert "FTS" in caplog.text
+    assert "could contain transcript content" not in caplog.text
+
+
+@pytest.mark.parametrize("operation", ["add", "replace", "delete", "rename"])
+def test_all_store_mutations_respect_another_writer(tmp_path, operation):
+    from vproc.errors import IndexBusyError
+
+    path = str(tmp_path / "db")
+    owner, contender = Store(path), Store(path)
+    owner.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
+    actions = {
+        "add": lambda: contender.add([_row("new", "p", [1.0, 0.0])], embedding_model="model-a"),
+        "replace": lambda: contender.replace_memory("m", "p", [_row("new", "p", [1.0, 0.0])], "model-a"),
+        "delete": lambda: contender.delete_memory("m", "p"),
+        "rename": lambda: contender.update_speaker("m", "p", "SPEAKER_0", "Renamed"),
+    }
+    before = owner._table().version
+    with owner.write_lock():
+        with pytest.raises(IndexBusyError):
+            actions[operation]()
+        # Readers remain usable while a writer stages replacement data.
+        assert [row["id"] for row in contender.memory_rows("m", "p")] == ["old"]
+    assert owner._table().version == before
+    assert owner.memory_rows("m", "p")[0]["speaker"] == "SPEAKER_0"
+
+
+def test_replace_memory_rejects_duplicate_existing_ids(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("same", "p", [1.0, 0.0]), _row("same", "p", [1.0, 0.0])],
+              embedding_model="model-a")
+    before = store._table().version
+    with pytest.raises(ValueError, match="id"):
+        store.replace_memory("m", "p", [_row("same", "p", [0.0, 1.0])], "model-a")
+    assert store._table().version == before
+    assert len(store.all_rows()) == 2
+
+
+def test_embedding_identity_rejects_nonfloating_vector_storage(tmp_path):
+    import pyarrow as pa
+
+    store = Store(str(tmp_path / "db"))
+    row = _row("old", "p", [1, 0])
+    schema = pa.Table.from_pylist([row]).schema
+    schema = schema.set(schema.get_field_index("vector"), pa.field("vector", pa.list_(pa.int32(), 2)))
+    schema = schema.with_metadata({b"vproc:embedding_model": b"model-a",
+                                   b"vproc:embedding_dimension": b"2"})
+    store.db.create_table(store.TABLE, [row], schema=schema)
+    with pytest.raises(ValueError, match="metadata"):
+        store.validate_embedding_model("model-a")
+
+
+def test_fts_search_failure_warns_without_logging_query_or_transcript(tmp_path, monkeypatch, caplog):
+    from lancedb.table import LanceTable
+
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
+    original = LanceTable.search
+    def fail_fts(self, *args, **kwargs):
+        if kwargs.get("query_type") == "fts":
+            raise RuntimeError("private transcript text")
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(LanceTable, "search", fail_fts)
+    assert store.fts_search("private query text", 1) == []
+    assert store.vector_search([1.0, 0.0], 1, embedding_model="model-a")[0]["id"] == "old"
+    assert "FTS" in caplog.text
+    assert "private query text" not in caplog.text
+    assert "private transcript text" not in caplog.text

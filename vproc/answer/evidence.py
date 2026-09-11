@@ -1,4 +1,4 @@
-from vproc.models import Evidence
+from vproc.models import Evidence, mmss
 
 
 def _text(hit: dict) -> str:
@@ -18,5 +18,12 @@ def build_evidence(hits: list[dict]) -> list[Evidence]:
     return out
 
 
+def evidence_text(e: Evidence) -> str:
+    # Speaker and meeting identity are source evidence too. Generation and verification
+    # must see the same metadata to support questions such as "who said this?".
+    return (f"Meeting: {e.memory_title}\nSpeaker: {e.speaker}\n"
+            f"Time: {mmss(e.start_ts)}-{mmss(e.end_ts)}\n{e.text}")
+
+
 def evidence_block(evidence: list[Evidence]) -> str:
-    return "\n".join(f'[{e.key}] "{e.text}"' for e in evidence)
+    return "\n".join(f'[{e.key}] "{evidence_text(e)}"' for e in evidence)
