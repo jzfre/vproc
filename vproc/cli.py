@@ -8,10 +8,11 @@ from vproc.errors import IndexBusyError
 from vproc.locking import IndexWriteLock
 from vproc.paths import memory_directory
 
-USAGE = """usage: vproc [ingest <video.mp4> | serve | speakers <memory> [--set 'SPEAKER_XX=Name'] | doctor]
+USAGE = """usage: vproc [ingest <video.mp4> | serve | analyze <memory> "<question>" | speakers <memory> [--set 'SPEAKER_XX=Name'] | doctor]
 
   ingest     Transcribe and index a video.
   serve      Start the HTTP and MCP service.
+  analyze    Ask a freeform question about a whole meeting transcript (summary, todos, topics).
   speakers   List or rename speakers in a memory.
   doctor     Check local installation prerequisites offline.
   --help     Show this help.
@@ -121,6 +122,12 @@ def _main(args: list[str]) -> None:
 
         cfg = load_config()
         uvicorn.run(create_app(cfg=cfg), host=cfg.host, port=cfg.port)
+    elif len(args) == 3 and args[0] == "analyze":
+        from vproc.answer.analyze import analyze_memory
+
+        cfg = load_config()
+        store = _store_for(cfg)
+        print(analyze_memory(store, cfg, args[1], args[2]))
     elif len(args) >= 2 and args[0] == "speakers":
         _speakers(args[1:])
     else:

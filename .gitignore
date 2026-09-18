@@ -20,6 +20,14 @@ vproc_frames*/
 hf_token*
 **/secrets*
 
+# Local model weights / caches (relayed or downloaded; never commit)
+/models/
+*.safetensors
+*.gguf
+*.npz
+*.ckpt
+pytorch_model.bin
+
 # Python
 __pycache__/
 *.py[cod]
@@ -29,6 +37,9 @@ venv/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+
+# Local agent/setup notes (machine-specific; not for the public repo)
+AGENTS.md
 
 # OS / editor
 .DS_Store
