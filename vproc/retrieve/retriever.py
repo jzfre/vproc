@@ -3,6 +3,11 @@ import re
 from vproc.llm import client
 
 
+# Scaffolding that ingest adds to indexed text ("[SCREEN]", "[SPOKEN]", "LABEL (mm:ss):"). It is
+# not meeting content, so it must not count as a literal match. The speaker label stays: it is.
+_SCAFFOLD = re.compile(r"^\[(?:SCREEN|SPOKEN)\]$|\(\d{2,}:\d{2}\):", re.M)
+
+
 def rrf(rankings: list[list[str]], k: int = 60) -> dict[str, float]:
     scores: dict[str, float] = {}
     for ranking in rankings:
@@ -14,7 +19,8 @@ def rrf(rankings: list[list[str]], k: int = 60) -> dict[str, float]:
 def retrieve(store, cfg, query: str, k: int = 8, where: str | None = None,
              embed=client.embed_texts):
     store.validate_embedding_model(cfg.embed.model)
-    vectors = embed(cfg.embed.base_url, cfg.embed.model, [query])
+    # The prefix is for the embedder only; FTS and the keyword rule below use the raw query.
+    vectors = embed(cfg.embed.base_url, cfg.embed.model, [cfg.embed_query_prefix + query])
     if len(vectors) != 1:
         raise ValueError(f"Expected one query embedding, received {len(vectors)}")
     qvec = vectors[0]
@@ -28,10 +34,20 @@ def retrieve(store, cfg, query: str, k: int = 8, where: str | None = None,
     # (one hit's text contains ALL query tokens) so an exact match like 'ERR-4127' survives
     # ask_memory's top_sim < sim_floor gate without generic questions bypassing it.
     qtokens = set(re.findall(r"\w+", query.lower()))
-    if qtokens and any(qtokens <= set(re.findall(r"\w+", h.get("embed_text", "").lower()))
-                       for h in fhits):
+
+    def keyword_match(hit: dict) -> bool:
+        content = _SCAFFOLD.sub(" ", hit.get("embed_text", ""))
+        return bool(qtokens) and qtokens <= set(re.findall(r"\w+", content.lower()))
+
+    if any(keyword_match(h) for h in fhits):
         top_sim = max(top_sim, cfg.sim_floor)
+    similarity = {h["id"]: 1.0 - float(h["_distance"]) for h in vhits}
     by_id = {h["id"]: h for h in (vhits + fhits)}
+    for sid, hit in by_id.items():
+        # Search returns the k nearest vectors whatever the query, so expose how near each hit
+        # is and whether it literally contains the query. Cosine values are model-specific.
+        hit["_similarity"] = similarity.get(sid)
+        hit["_keyword_match"] = keyword_match(hit)
     ranked = sorted(
         rrf([[h["id"] for h in vhits], [h["id"] for h in fhits]]).items(),
         key=lambda kv: kv[1], reverse=True,

@@ -1,0 +1,24 @@
+# Template: optional CPU ASR + embedding server for a Linux host (see scripts/local_models.py).
+# Install as a user unit (adjust the checkout path if yours differs):
+#   install -D -m 644 deploy/systemd/vproc-models.service ~/.config/systemd/user/vproc-models.service
+#   systemctl --user daemon-reload && systemctl --user enable --now vproc-models.service
+# Run `loginctl enable-linger $USER` once so user units start at boot without a login.
+# User units do not read shell profiles: `uv` must be on the PATH below (astral's installer
+# puts it in ~/.local/bin).
+[Unit]
+Description=vproc local models (CPU whisper + embeddings)
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=%h/Code/personal/vproc
+ExecStart=/usr/bin/env uv run --locked --script scripts/local_models.py
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=10
+UMask=0077
+# A long transcription peaks near 11 GB; fail this unit rather than the whole host.
+MemoryMax=16G
+
+[Install]
+WantedBy=default.target

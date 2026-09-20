@@ -1,0 +1,22 @@
+# Template: the vproc web UI + REST/MCP service as a user unit. `.env` is read from the
+# WorkingDirectory. The venv's own entry point is used so starting the service never re-syncs it.
+#   install -D -m 644 deploy/systemd/vproc-web.service ~/.config/systemd/user/vproc-web.service
+#   systemctl --user daemon-reload && systemctl --user enable --now vproc-web.service
+[Unit]
+Description=vproc web UI and API
+Wants=vproc-models.service
+After=vproc-models.service
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=%h/Code/personal/vproc
+ExecStart=%h/Code/personal/vproc/.venv/bin/vproc serve
+Environment=PYTHONUNBUFFERED=1
+# Restart=always also covers boot races: if VPROC_HOST is a VPN address that is not up yet,
+# the bind fails and systemd simply retries until it is.
+Restart=always
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=default.target

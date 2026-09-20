@@ -10,6 +10,12 @@ SYSTEM = (
     'Respond as strict JSON: {"answered": bool, "claims": [{"text": str, "evidence_ids": [str]}]}'
 )
 
+# An answer is a handful of claims. Unbounded, a non-thinking model was seen answering correctly
+# and then appending claims about everything in the evidence until max_tokens: minutes of
+# generation ending in truncated JSON, i.e. an abstention. Constrained decoding enforces the
+# schema bound; generate() also slices, for backends that ignore it.
+MAX_CLAIMS = 6
+
 # Schema for constrained decoding (json_schema response_format). Structurally enforces the
 # {answered, claims:[{text, evidence_ids}]} shape the rest of the pipeline depends on.
 ANSWER_SCHEMA = {
@@ -18,6 +24,7 @@ ANSWER_SCHEMA = {
         "answered": {"type": "boolean"},
         "claims": {
             "type": "array",
+            "maxItems": MAX_CLAIMS,
             "items": {
                 "type": "object",
                 "properties": {
@@ -65,4 +72,5 @@ def generate(cfg, question: str, evidence_block: str, chat=client.chat_json) -> 
         and isinstance(c.get("evidence_ids"), list)
         and c["evidence_ids"] and all(isinstance(e, str) for e in c["evidence_ids"])
     ]
+    claims = claims[:MAX_CLAIMS]
     return {"answered": bool(claims), "claims": claims}

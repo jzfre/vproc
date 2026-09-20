@@ -22,7 +22,13 @@ dependencies = [
 [project.optional-dependencies]
 # Model libraries are optional; the server and remote-endpoint ingest work without them.
 answer = ["transformers>=4.51,<5", "torch>=2.4"]
-diarization = ["pyannote-audio>=4.0"]
+diarization = [
+    "pyannote-audio>=4.0",
+    # Direct Linux requirements only so the CPU wheel source below applies to them as well
+    # (uv sources cover direct dependencies); pyannote already depends on both.
+    "torchaudio>=2.8; sys_platform == 'linux'",
+    "torchcodec>=0.7; sys_platform == 'linux'",
+]
 local-asr = ["mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 # Convenience install for all supported local model features.
 runtime = [
@@ -31,6 +37,8 @@ runtime = [
     "transformers>=4.51,<5",
     "torch>=2.4",
     "pyannote-audio>=4.0",
+    "torchaudio>=2.8; sys_platform == 'linux'",
+    "torchcodec>=0.7; sys_platform == 'linux'",
     "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
@@ -65,3 +73,17 @@ include = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+# vproc has no CUDA code path (models run on CPU, or MPS on a Mac), so Linux installs take
+# PyTorch's CPU wheels: PyPI's Linux torch pulls ~5 GB of CUDA libraries, and PyPI's Linux
+# torchcodec cannot even load without them. macOS resolution is unchanged. These sources are
+# not wheel metadata: for a wheel install use `uv pip install --torch-backend cpu ...`.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchcodec = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

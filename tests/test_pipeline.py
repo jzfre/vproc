@@ -79,6 +79,8 @@ def _patch(monkeypatch, tmp_path, frames=None, transcript=None, has_audio=True):
     monkeypatch.setattr(P.T, "transcribe", lambda wav, ep=None: list(ts))
     monkeypatch.setattr(P.O, "ocr_frame", lambda ocr, path, timeout=None, max_tokens=None: "Roadmap Q3")
     monkeypatch.setattr(P.EI, "embed_rows", lambda cfg, segs, **k: [_row_of(s) for s in segs])
+    monkeypatch.setattr(P.EI, "preflight", lambda cfg, store, **k: store.validate_embedding_model(
+        cfg.embed.model, 2))  # no network; the index-compatibility half still runs
 
 
 def test_ingest_video_builds_segments(tmp_path, monkeypatch):
@@ -565,8 +567,13 @@ def test_real_silent_video_ingest_and_replacement(tmp_path, monkeypatch):
          "-c:v", "mpeg4", str(video)], check=True,
     )
     monkeypatch.setattr(P.O, "ocr_frame", lambda *args: "Agenda")
+    from vproc.ingest.embed_index import preflight
+
     monkeypatch.setattr(P.EI, "embed_rows", lambda cfg, segments:
                         embed_rows(cfg, segments, embed=lambda *args: [[1.0, 0.0]] * len(segments)))
+    # The real preflight, with a fake embedder: its dimension check runs against the real Store.
+    monkeypatch.setattr(P.EI, "preflight", lambda cfg, store:
+                        preflight(cfg, store, embed=lambda *args: [[1.0, 0.0]]))
     cfg = _cfg(tmp_path)
     store = Store(cfg.index_path)
 
@@ -603,3 +610,188 @@ def test_real_silent_video_ingest_and_replacement(tmp_path, monkeypatch):
     new_name = client.get("/api/memories/slides/segments").json()[0]["frame_name"]
     assert client.get(f"/api/frames/slides/{new_name}").status_code == 200
     assert client.get(f"/api/frames/slides/{old_name}").status_code == 404
+
+
+def test_ingest_registers_endpoint_api_keys(tmp_path, monkeypatch):
+    # The CLI reaches model servers only through ingest_video's Config.
+    _patch(monkeypatch, tmp_path)
+    seen = []
+    monkeypatch.setattr(P.client, "configure", seen.append)
+    cfg = _cfg(tmp_path)
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=FakeStore())
+    assert seen == [cfg]
+
+
+def test_ingest_reports_each_stage_on_stderr(tmp_path, monkeypatch, capsys):
+    # A long ingest must show where it is: minutes of silence look like a hang.
+    _patch(monkeypatch, tmp_path)
+    P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=FakeStore())
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("[ingest] ")]
+    stages = [line.split()[1] for line in lines]
+    assert stages == ["frames:", "transcript:", "ocr:", "index:"]
+    assert "2 kept" in lines[0] and "1 segments" in lines[1] and "2 chunks" in lines[3]
+    assert "[ingest]" not in captured.out  # stdout stays the CLI's result line
+
+
+def test_ingest_reports_diarization_stage(tmp_path, monkeypatch, capsys):
+    from vproc.ingest.diarize import SpeakerTurn
+
+    _patch(monkeypatch, tmp_path)
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "some/model"
+    monkeypatch.setattr(P.D, "diarize", lambda wav, cfg: [
+        SpeakerTurn(0.0, 6.0, "SPEAKER_00"), SpeakerTurn(6.0, 30.0, "SPEAKER_01")])
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=FakeStore())
+    assert "[ingest] speakers: 2 speakers in 2 turns" in capsys.readouterr().err
+
+
+def test_disabled_ocr_never_calls_the_vision_endpoint(tmp_path, monkeypatch, capsys):
+    from vproc.ingest.diarize import SpeakerTurn
+
+    _patch(monkeypatch, tmp_path)
+
+    def must_not_run(*args, **kwargs):
+        pytest.fail("OCR is disabled: the vision endpoint must not be called")
+
+    monkeypatch.setattr(P.O, "ocr_frame", must_not_run)
+    monkeypatch.setattr(P.N, "sample_name_votes", must_not_run)
+    monkeypatch.setattr(P.D, "diarize", lambda wav, cfg: [SpeakerTurn(0.0, 30.0, "SPEAKER_00")])
+    cfg = _cfg(tmp_path)
+    cfg.ocr = Endpoint("", "unused")
+    cfg.diarize_model = "some/model"
+    cfg.speaker_naming = True  # nameplate naming needs the same vision endpoint
+    store = FakeStore()
+    assert P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store) == 1
+    assert all(r["on_screen_text"] == "" for r in store.rows)
+    assert any(r["frame_path"] for r in store.rows)  # frames are still kept for the UI
+    assert "[ingest] ocr: disabled" in capsys.readouterr().err
+
+
+def test_embedding_preflight_failure_stops_before_any_media_work(tmp_path, monkeypatch):
+    # The embedder is the dependency that used to fail LAST, after minutes of ASR/diarization.
+    _patch(monkeypatch, tmp_path)
+
+    def down(cfg, store, **kwargs):
+        raise ConnectionError("embedding server is down")
+
+    def must_not_run(*args, **kwargs):
+        pytest.fail("no media work may start before the embedding backend is known to work")
+
+    monkeypatch.setattr(P.EI, "preflight", down)
+    monkeypatch.setattr(P.subprocess, "run", must_not_run)
+    monkeypatch.setattr(P.T, "transcribe", must_not_run)
+    store = FakeStore()
+    with pytest.raises(ConnectionError):
+        P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=store)
+    assert store.calls == []
+
+
+def test_failed_diarization_never_replaces_a_speaker_labelled_memory(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path)
+
+    def boom(wav, cfg):
+        raise RuntimeError("401 gated repo")
+
+    monkeypatch.setattr(P.D, "diarize", boom)
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "pyannote/fake"
+    store = FakeStore()
+    store.rows = [{"id": "old", "memory_id": "standup", "project_id": "default",
+                   "speaker": "Ada Lovelace", "frame_path": ""}]
+    with pytest.raises(ValueError, match="VPROC_DIARIZE_MODEL"):
+        P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    assert [r["id"] for r in store.rows] == ["old"]  # the good memory is untouched
+
+
+def test_degraded_ingest_ends_with_one_actionable_summary(tmp_path, monkeypatch, capsys):
+    _patch(monkeypatch, tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("backend down")
+
+    monkeypatch.setattr(P.D, "diarize", boom)
+    monkeypatch.setattr(P.O, "ocr_frame", boom)
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "pyannote/fake"
+    assert P.ingest_video("/videos/standup.mp4", cfg=cfg, store=FakeStore()) >= 1
+    summary = [line for line in capsys.readouterr().err.splitlines() if "DEGRADED" in line]
+    assert len(summary) == 1
+    assert "no speaker labels" in summary[0] and "OCR failed for 2 of 2 frames" in summary[0]
+
+
+def test_clean_ingest_prints_no_degraded_summary(tmp_path, monkeypatch, capsys):
+    _patch(monkeypatch, tmp_path)
+    P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=FakeStore())
+    assert "DEGRADED" not in capsys.readouterr().err
+
+
+def test_only_frames_the_index_references_are_kept(tmp_path, monkeypatch):
+    # The second screen state has no speech and no on-screen text, so no row points at its
+    # frame: storing it would leave a file that cleanup (which follows rows) can never find.
+    _patch(monkeypatch, tmp_path)
+    monkeypatch.setattr(P.O, "ocr_frame", lambda *args: "")
+    cfg = _cfg(tmp_path)
+    store = FakeStore()
+    assert P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store) == 1
+    stored = sorted(p.name for p in pathlib.Path(cfg.frames_dir, "default", "standup").glob("*.png"))
+    assert stored == [os.path.basename(store.rows[0]["frame_path"])]
+
+
+def test_ffmpeg_failure_is_a_clean_ingest_error(tmp_path, monkeypatch):
+    import subprocess
+
+    from vproc.errors import IngestError
+
+    _patch(monkeypatch, tmp_path)
+
+    def fail(cmd, **kwargs):
+        raise subprocess.CalledProcessError(234, cmd)
+
+    monkeypatch.setattr(P.subprocess, "run", fail)
+    with pytest.raises(IngestError, match="ffmpeg failed while sampling frames"):
+        P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=FakeStore())
+
+
+def test_degraded_summary_is_printed_even_when_nothing_could_be_indexed(tmp_path, monkeypatch, capsys):
+    # No audio + every OCR call failing = zero segments: the summary is the explanation.
+    _patch(monkeypatch, tmp_path, has_audio=False)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("vision backend down")
+
+    monkeypatch.setattr(P.O, "ocr_frame", boom)
+    assert P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=FakeStore()) == 0
+    assert "[ingest] DEGRADED: OCR failed for 2 of 2 frames" in capsys.readouterr().err
+
+
+def test_unreachable_embedding_backend_is_a_message_not_a_traceback(tmp_path, monkeypatch):
+    import httpx
+    from openai import APIConnectionError
+
+    from vproc.errors import IngestError
+
+    _patch(monkeypatch, tmp_path)
+
+    def down(cfg, store, **kwargs):
+        raise APIConnectionError(request=httpx.Request("POST", "http://user:secret@embed/v1/embeddings"))
+
+    monkeypatch.setattr(P.EI, "preflight", down)
+    with pytest.raises(IngestError, match="doctor --online") as excinfo:
+        P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=FakeStore())
+    assert "secret" not in str(excinfo.value)
+
+
+def test_reingest_says_when_it_replaces_manual_speaker_names(tmp_path, monkeypatch, capsys):
+    from vproc.ingest.diarize import SpeakerTurn
+
+    _patch(monkeypatch, tmp_path)
+    monkeypatch.setattr(P.D, "diarize", lambda wav, cfg: [SpeakerTurn(0.0, 30.0, "SPEAKER_00")])
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "some/model"
+    store = FakeStore()
+    store.rows = [{"id": "old", "memory_id": "standup", "project_id": "default",
+                   "speaker": "Ada Lovelace", "frame_path": ""}]
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    err = capsys.readouterr().err
+    assert "previous speaker names" in err and "vproc speakers" in err

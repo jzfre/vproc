@@ -14,6 +14,9 @@ class _FakeStore:
     def write_lock(self):
         return nullcontext()
 
+    def memory_rows(self, memory_id, project_id=None):
+        return list(getattr(self, "rows", []))
+
     def update_speaker(self, memory_id, project_id, old, new):
         self.renames.append((memory_id, project_id, old, new))
         return self.rows_updated
@@ -93,6 +96,7 @@ def test_speakers_set_bootstraps_missing_map(tmp_path, monkeypatch):
 
 def test_speakers_missing_map_is_friendly(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("VPROC_FRAMES_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("VPROC_INDEX_PATH", str(tmp_path / "db"))  # never the developer's real index
     monkeypatch.setattr("sys.argv", ["vproc", "speakers", "nope"])
     cli.main()
     assert "no speaker map" in capsys.readouterr().out.lower()
@@ -211,3 +215,46 @@ def test_doctor_invalid_configuration_exits_cleanly(monkeypatch, capsys):
         cli.main()
     assert exc.value.code == 1
     assert "VPROC_PORT" in capsys.readouterr().err
+
+
+def test_ingest_error_prints_a_message_not_a_traceback(monkeypatch, capsys):
+    import vproc.ingest.pipeline as pipeline
+    from vproc.errors import IngestError
+
+    def fail(path):
+        raise IngestError("ffprobe failed for nope.mp4: No such file or directory")
+
+    monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+    monkeypatch.setattr(pipeline, "ingest_video", fail)
+    monkeypatch.setattr(cli.sys, "argv", ["vproc", "ingest", "nope.mp4"])
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+    assert excinfo.value.code == 1
+    assert "error: ffprobe failed for nope.mp4" in capsys.readouterr().err
+
+
+def test_speakers_list_shows_who_each_label_is_without_a_sidecar(tmp_path, monkeypatch, capsys):
+    # Without a vision model nothing names the speakers: the owner needs talk time and sample
+    # quotes with timestamps to decide who SPEAKER_01 is before renaming.
+    monkeypatch.setenv("VPROC_FRAMES_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("VPROC_INDEX_PATH", str(tmp_path / "db"))
+    (tmp_path / "db").mkdir()
+    fake = _FakeStore(str(tmp_path / "db"))
+    fake.rows = [
+        {"speaker": "SPEAKER_01", "start_ts": 0.0, "end_ts": 60.0,
+         "said_text": "one two three four five six seven eight nine ten eleven twelve thirteen fourteen"},
+        {"speaker": "SPEAKER_01", "start_ts": 100.0, "end_ts": 130.0, "said_text": "short remark"},
+        {"speaker": "SPEAKER_00", "start_ts": 60.0, "end_ts": 65.0, "said_text": "Right."},
+        # An OCR-only chunk (silent slide) is nobody's talk time; its placeholder label is
+        # "SPEAKER_0", which must not show up as a speaker to rename.
+        {"speaker": "SPEAKER_0", "start_ts": 200.0, "end_ts": 500.0, "said_text": ""},
+    ]
+    monkeypatch.setattr(cli, "_store_for", lambda cfg: fake)
+    monkeypatch.setattr("sys.argv", ["vproc", "speakers", "standup"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert out.index("SPEAKER_01") < out.index("SPEAKER_00")  # most talk time first
+    assert "01:30" in out and "2 chunks" in out
+    assert '00:00 "one two three four five six seven eight nine ten eleven twelve..."' in out
+    assert "--set" in out  # says how to rename
+    assert "SPEAKER_0:" not in out and '""' not in out

@@ -7,6 +7,7 @@ def test_extract_audio_cmd():
     assert cmd[:1] == ["ffmpeg"]
     assert "-ar" in cmd and "16000" in cmd and cmd[-1] == "/o/a.wav"
     assert "-nostdin" in cmd  # don't read the TTY: backgrounded ingests must not stop on SIGTTIN
+    assert cmd[cmd.index("-loglevel") + 1] == "error"  # no progress spam in ingest logs
 
 def test_segments_from_whisper_filters_empty_and_strips():
     result = {"segments": [
@@ -74,3 +75,43 @@ def test_transcribe_uses_local_when_base_url_empty():
     assert cap["model"] == "local-model"
     assert cap["condition_on_previous_text"] is False
     assert out == [TranscriptSegment(0.0, 1.0, "local hi")]
+
+
+def test_segments_from_whisper_keeps_word_timestamps():
+    result = {"segments": [{"start": 0.0, "end": 2.0, "text": " Hello there.", "words": [
+        {"start": 0.0, "end": 0.9, "word": " Hello"}, {"start": 1.0, "end": 2.0, "word": " there."}]}]}
+    assert segments_from_whisper(result)[0].words == [(0.0, 0.9, "Hello"), (1.0, 2.0, "there.")]
+
+
+def test_segments_from_whisper_drops_words_that_do_not_spell_the_segment():
+    # Misaligned words would attribute text to the wrong speaker: segment-level is safer.
+    result = {"segments": [{"start": 0.0, "end": 2.0, "text": "Hello there.", "words": [
+        {"start": 0.0, "end": 0.9, "word": "Goodbye"}]}]}
+    seg = segments_from_whisper(result)[0]
+    assert seg.text == "Hello there." and seg.words is None
+
+
+def test_local_transcription_requests_word_timestamps():
+    captured = {}
+
+    def fake(audio, path_or_hf_repo, **kw):
+        captured.update(kw)
+        return {"segments": []}
+
+    transcribe("a.wav", transcriber=fake)
+    assert captured["word_timestamps"] is True
+
+
+def test_local_transcription_survives_a_word_alignment_failure(capsys):
+    # Word timestamps are an improvement, never a reason to lose the transcript.
+    calls = []
+
+    def flaky(audio, path_or_hf_repo, **kw):
+        calls.append(kw["word_timestamps"])
+        if kw["word_timestamps"]:
+            raise RuntimeError("alignment heads missing")
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}
+
+    assert transcribe("a.wav", transcriber=flaky) == [TranscriptSegment(0.0, 1.0, "hi")]
+    assert calls == [True, False]
+    assert "word timestamps" in capsys.readouterr().err

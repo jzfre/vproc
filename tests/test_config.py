@@ -202,8 +202,10 @@ def test_config_requires_endpoint_models(field, model):
         _config(**{field: Endpoint("u", model)})
 
 
-@pytest.mark.parametrize("field", ["ocr", "embed", "grounding"])
-@pytest.mark.parametrize("url", ["", " \t", None, "bad\0url"])
+@pytest.mark.parametrize("field, url", [
+    (field, url) for field in ("ocr", "embed", "grounding") for url in ("", " \t", None, "bad\0url")
+    if (field, url) != ("ocr", "")  # an explicitly empty OCR URL means "OCR disabled"
+])
 def test_config_requires_remote_endpoint_values(field, url):
     with pytest.raises(ValueError, match=field):
         _config(**{field: Endpoint(url, "model")})
@@ -252,7 +254,7 @@ def test_load_config_rejects_invalid_endpoint_urls(clean_config_env, monkeypatch
         load_config()
 
 
-@pytest.mark.parametrize("key", ["VPROC_OCR_BASE_URL", "VPROC_EMBED_BASE_URL", "VPROC_GROUNDING_BASE_URL"])
+@pytest.mark.parametrize("key", ["VPROC_EMBED_BASE_URL", "VPROC_GROUNDING_BASE_URL"])
 def test_load_config_rejects_empty_remote_endpoint(clean_config_env, monkeypatch, key):
     monkeypatch.setenv(key, "")
     with pytest.raises(ValueError, match=key):
@@ -292,8 +294,149 @@ def test_load_dotenv_ignores_invalid_keys_and_nul_without_losing_valid_lines(tmp
     env = tmp_path / ".env"
     env.write_text("BAD KEY=x\nBAD-KEY=x\n9BAD=x\nBAD\0KEY=x\nVPROC_NUL=bad\0value\n"
                    "VPROC_PRESET=file\nVPROC_OK=ok\n")
+    try:
+        load_dotenv(str(env))
+        assert os.environ["VPROC_PRESET"] == "external"
+        assert os.environ["VPROC_OK"] == "ok"
+        for key in keys[:-1]:
+            assert key not in os.environ
+    finally:
+        os.environ.pop("VPROC_OK", None)  # load_dotenv writes os.environ directly: do not leak it
+
+
+def test_endpoint_api_key_defaults_to_none(clean_config_env):
+    cfg = load_config()
+    assert [ep.api_key for ep in (cfg.ocr, cfg.embed, cfg.grounding, cfg.transcribe)] == [None] * 4
+
+
+def test_endpoint_api_key_from_environment(clean_config_env, monkeypatch):
+    monkeypatch.setenv("VPROC_GROUNDING_API_KEY", "  s3cret ")
+    cfg = load_config()
+    assert cfg.grounding.api_key == "s3cret"
+    assert cfg.embed.api_key is None
+
+
+def test_endpoint_api_key_from_file(clean_config_env, monkeypatch, tmp_path):
+    key_file = tmp_path / "api-key"
+    key_file.write_text("file-s3cret\n")
+    monkeypatch.setenv("VPROC_GROUNDING_API_KEY_FILE", str(key_file))
+    assert load_config().grounding.api_key == "file-s3cret"
+
+
+def test_endpoint_api_key_file_expands_home(clean_config_env, monkeypatch, tmp_path):
+    (tmp_path / "k").write_text("home-s3cret")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VPROC_EMBED_API_KEY_FILE", "~/k")
+    assert load_config().embed.api_key == "home-s3cret"
+
+
+@pytest.mark.parametrize("content", [None, "", " \n"])
+def test_endpoint_api_key_file_must_be_readable_and_nonempty(clean_config_env, monkeypatch,
+                                                             tmp_path, content):
+    key_file = tmp_path / "api-key"
+    if content is not None:
+        key_file.write_text(content)
+    monkeypatch.setenv("VPROC_OCR_API_KEY_FILE", str(key_file))
+    with pytest.raises(ValueError, match="VPROC_OCR_API_KEY_FILE"):
+        load_config()
+
+
+def test_endpoint_api_key_and_file_are_mutually_exclusive(clean_config_env, monkeypatch, tmp_path):
+    key_file = tmp_path / "api-key"
+    key_file.write_text("file-s3cret")
+    monkeypatch.setenv("VPROC_GROUNDING_API_KEY", "env-s3cret")
+    monkeypatch.setenv("VPROC_GROUNDING_API_KEY_FILE", str(key_file))
+    with pytest.raises(ValueError, match="VPROC_GROUNDING_API_KEY") as excinfo:
+        load_config()
+    assert "s3cret" not in str(excinfo.value)
+
+
+def test_endpoint_api_key_never_appears_in_repr(clean_config_env, monkeypatch):
+    monkeypatch.setenv("VPROC_GROUNDING_API_KEY", "s3cret")
+    cfg = load_config()
+    assert "s3cret" not in repr(cfg) and "s3cret" not in repr(cfg.grounding)
+
+
+def test_endpoints_sharing_a_base_url_share_its_api_key(clean_config_env, monkeypatch):
+    # One vLLM commonly serves OCR and grounding: a key set for either applies to that URL.
+    monkeypatch.setenv("VPROC_OCR_BASE_URL", "http://llm:8000/v1")
+    monkeypatch.setenv("VPROC_GROUNDING_BASE_URL", "http://llm:8000/v1")
+    monkeypatch.setenv("VPROC_GROUNDING_API_KEY", "s3cret")
+    cfg = load_config()
+    assert cfg.api_key_for("http://llm:8000/v1") == "s3cret"
+    assert cfg.api_key_for(cfg.embed.base_url) is None
+
+
+def test_conflicting_api_keys_for_one_base_url_are_rejected(clean_config_env, monkeypatch):
+    monkeypatch.setenv("VPROC_OCR_BASE_URL", "http://llm:8000/v1")
+    monkeypatch.setenv("VPROC_GROUNDING_BASE_URL", "http://llm:8000/v1")
+    monkeypatch.setenv("VPROC_OCR_API_KEY", "one-s3cret")
+    monkeypatch.setenv("VPROC_GROUNDING_API_KEY", "two-s3cret")
+    with pytest.raises(ValueError, match="different API keys") as excinfo:
+        load_config()
+    assert "s3cret" not in str(excinfo.value)
+
+
+def test_api_key_applies_to_trailing_slash_twin_of_its_base_url(clean_config_env, monkeypatch):
+    monkeypatch.setenv("VPROC_OCR_BASE_URL", "http://llm:8000/v1/")
+    monkeypatch.setenv("VPROC_GROUNDING_BASE_URL", "http://llm:8000/v1")
+    monkeypatch.setenv("VPROC_GROUNDING_API_KEY", "s3cret")
+    cfg = load_config()
+    assert cfg.api_key_for("http://llm:8000/v1/") == "s3cret"
+    assert cfg.ocr.base_url == "http://llm:8000/v1/"  # the configured URL itself is untouched
+
+
+def test_empty_ocr_base_url_disables_ocr(clean_config_env, monkeypatch):
+    # Same convention as VPROC_TRANSCRIBE_BASE_URL= and VPROC_DIARIZE_MODEL=: an explicit
+    # empty value switches the feature off (e.g. a text-only LLM host with no vision model).
+    monkeypatch.setenv("VPROC_OCR_BASE_URL", "")
+    assert load_config().ocr.base_url == ""
+
+
+def test_whitespace_ocr_base_url_is_still_rejected(clean_config_env, monkeypatch):
+    monkeypatch.setenv("VPROC_OCR_BASE_URL", "  ")
+    with pytest.raises(ValueError, match="VPROC_OCR_BASE_URL"):
+        load_config()
+
+
+def test_embed_query_prefix_defaults_to_empty(clean_config_env):
+    assert load_config().embed_query_prefix == ""
+
+
+def test_embed_query_prefix_decodes_newlines_and_keeps_trailing_space(clean_config_env, monkeypatch,
+                                                                      tmp_path):
+    # .env values are one line: "\n" is written literally, and quotes keep the trailing space.
+    env = tmp_path / ".env"
+    env.write_text('VPROC_EMBED_QUERY_PREFIX="Instruct: find passages\\nQuery: "\n')
+    monkeypatch.delenv("VPROC_EMBED_QUERY_PREFIX", raising=False)
     load_dotenv(str(env))
-    assert os.environ["VPROC_PRESET"] == "external"
-    assert os.environ["VPROC_OK"] == "ok"
-    for key in keys[:-1]:
-        assert key not in os.environ
+    try:
+        assert load_config().embed_query_prefix == "Instruct: find passages\nQuery: "
+    finally:
+        os.environ.pop("VPROC_EMBED_QUERY_PREFIX", None)
+
+
+def test_known_env_lists_every_setting_config_reads():
+    # doctor warns about VPROC_* names outside KNOWN_ENV, so a setting added to load_config
+    # without being listed would be reported to users as a typo.
+    import re
+    from pathlib import Path
+
+    import vproc.config as config
+
+    source = Path(config.__file__).read_text()
+    literals = set(re.findall(r'"(VPROC_[A-Z_]+)"', source))
+    prefixes = {"VPROC_OCR", "VPROC_EMBED", "VPROC_GROUNDING", "VPROC_TRANSCRIBE"}
+    assert literals - prefixes <= config.KNOWN_ENV
+    assert {f"{p}{s}" for p in prefixes for s in ("_BASE_URL", "_MODEL", "_API_KEY", "_API_KEY_FILE")} \
+        <= config.KNOWN_ENV
+
+
+def test_load_dotenv_reports_which_file_it_loaded(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("UNUSED_VPROC_TEST_KEY=1\n")
+    try:
+        assert load_dotenv(str(env)) == str(env.resolve())
+        assert load_dotenv(str(tmp_path / "missing.env")) is None
+    finally:
+        os.environ.pop("UNUSED_VPROC_TEST_KEY", None)

@@ -94,3 +94,59 @@ def test_retrieve_rejects_missing_or_extra_query_embeddings(tmp_path, vectors):
     store = Store(str(tmp_path / "db"))
     with pytest.raises(ValueError, match="embedding"):
         retrieve(store, _cfg(), "budget", embed=lambda *args: vectors)
+
+
+def test_query_prefix_reaches_the_embedder_but_not_keyword_search(tmp_path):
+    # Instruction-tuned embedders (Qwen3-Embedding: "Instruct: ...\nQuery: ") want a prefix on
+    # queries only. Stored passages and the literal FTS/keyword leg keep the raw text.
+    from dataclasses import replace
+
+    store = Store(str(tmp_path / "db.lance"))
+    store.add([_row("code", [0.0, 1.0], "error ERR-4127 on rollout")], embedding_model="m")
+    seen = []
+
+    def fake_embed(base_url, model, texts):
+        seen.extend(texts)
+        return [[1.0, 0.0]]  # orthogonal: only the keyword leg can lift the floor
+
+    cfg = replace(_cfg(), embed_query_prefix="Instruct: find passages\nQuery: ")
+    hits, top_sim = retrieve(store, cfg, "ERR-4127", k=2, embed=fake_embed)
+    assert seen == ["Instruct: find passages\nQuery: ERR-4127"]
+    assert hits[0]["id"] == "code" and top_sim == cfg.sim_floor
+
+
+def test_hits_carry_similarity_and_true_keyword_match(tmp_path):
+    # Search always returns the k nearest vectors, so callers need to tell "about this" from
+    # "merely nearest". keyword_match means EVERY query token is in the hit (FTS alone is OR).
+    store = Store(str(tmp_path / "db.lance"))
+    store.add([_row("both", [1.0, 0.0], "error ERR-4127 on rollout"),
+               _row("vector_only", [0.9, 0.1], "deployment failed yesterday"),
+               _row("partial", [0.0, 1.0], "rollout budget")], embedding_model="m")
+    hits, _ = retrieve(store, _cfg(), "ERR-4127 rollout", k=3, embed=lambda *a: [[1.0, 0.0]])
+    by_id = {h["id"]: h for h in hits}
+    assert by_id["both"]["_keyword_match"] is True
+    assert by_id["both"]["_similarity"] == pytest.approx(1.0, abs=1e-5)
+    assert by_id["vector_only"]["_keyword_match"] is False
+    assert 0.9 < by_id["vector_only"]["_similarity"] < 1.0
+    assert by_id["partial"]["_keyword_match"] is False  # shares one token only
+
+
+def test_keyword_match_ignores_the_structural_markers_of_indexed_text(tmp_path):
+    # Review finding: indexed text carries "[SCREEN]", "[SPOKEN]" and "LABEL (mm:ss):" scaffolding,
+    # so the query "screen" was an "exact" match for every chunk and lifted the similarity floor.
+    from vproc.ingest.align import make_embed_text
+    from vproc.ingest.transcribe import TranscriptSegment
+
+    text = make_embed_text("", [TranscriptSegment(615.0, 620.0, "we talked about the hiring budget",
+                                                  speaker="SPEAKER_01")])
+    store = Store(str(tmp_path / "db.lance"))
+    store.add([_row("chunk", [0.0, 1.0], text)], embedding_model="m")
+    orthogonal = lambda *a: [[1.0, 0.0]]  # noqa: E731
+    for query in ("screen", "spoken", "10", "15"):
+        hits, top_sim = retrieve(store, _cfg(), query, k=2, embed=orthogonal)
+        assert not any(h["_keyword_match"] for h in hits), query
+        assert top_sim < _cfg().sim_floor, query          # no floor lift from scaffolding
+    hits, top_sim = retrieve(store, _cfg(), "hiring budget", k=2, embed=orthogonal)
+    assert hits[0]["_keyword_match"] is True and top_sim == _cfg().sim_floor
+    hits, _ = retrieve(store, _cfg(), "SPEAKER_01 budget", k=2, embed=orthogonal)
+    assert hits[0]["_keyword_match"] is True              # the speaker label is real content

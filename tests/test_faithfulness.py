@@ -30,3 +30,41 @@ def test_filter_drops_invalid_faithfulness_scores(score):
     claims = [{"text": "ships in July", "evidence_ids": ["E1"]}]
     by_key = {"E1": _ev("E1", "the product ships in July")}
     assert filter_claims(claims, by_key, lambda p, h: score, threshold=0.5) == []
+
+
+def _fake_transformers(monkeypatch, from_pretrained):
+    import sys
+    import types
+
+    auto = types.SimpleNamespace(from_pretrained=from_pretrained)
+    monkeypatch.setitem(sys.modules, "transformers",
+                        types.SimpleNamespace(AutoModelForSequenceClassification=auto))
+
+
+def test_hhem_public_model_loads_despite_a_stale_hf_token(monkeypatch):
+    # Hugging Face answers 401 to an invalid HF_TOKEN even for public repos, so a stale
+    # diarization token must not take the (public) answer verifier down with it.
+    from vproc.answer.faithfulness import HHEM
+
+    calls = []
+
+    def from_pretrained(model_id, **kw):
+        calls.append(kw)
+        if kw.get("token") is not False:
+            raise OSError("401 Client Error: invalid user token")
+        return "model"
+
+    _fake_transformers(monkeypatch, from_pretrained)
+    assert HHEM("vectara/hallucination_evaluation_model").model == "model"
+    assert [kw.get("token") for kw in calls] == [None, False]
+
+
+def test_hhem_load_failure_without_token_cause_still_raises(monkeypatch):
+    from vproc.answer.faithfulness import HHEM
+
+    def from_pretrained(model_id, **kw):
+        raise OSError("model files are missing")
+
+    _fake_transformers(monkeypatch, from_pretrained)
+    with pytest.raises(OSError, match="missing"):
+        HHEM("some/private-model")

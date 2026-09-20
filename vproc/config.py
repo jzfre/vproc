@@ -1,19 +1,21 @@
 import os
 import pathlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 DEFAULT_HHEM_MODEL = "vectara/hallucination_evaluation_model"
 DEFAULT_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
 
 
-def load_dotenv(path: str = ".env") -> None:
+def load_dotenv(path: str = ".env") -> str | None:
     """Minimal .env loader: KEY=VALUE lines, ignores blanks/comments/malformed lines, and
     does NOT override variables already set in the environment. Call from app entry points
-    (cli) so `vproc` works without manually sourcing .env; load_config() itself stays pure."""
+    (cli) so `vproc` works without manually sourcing .env; load_config() itself stays pure.
+    Returns the resolved file it loaded, or None when there was none (doctor reports this:
+    a missing .env silently means built-in defaults and an index in the current directory)."""
     if not os.path.exists(path):
-        return
+        return None
     # UTF-8 with optional BOM supports Windows editors without locale-dependent decoding.
     for line in pathlib.Path(path).read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
@@ -30,12 +32,29 @@ def load_dotenv(path: str = ".env") -> None:
         else:  # unquoted: drop an inline ` # comment`
             val = val.split(" #", 1)[0].strip()
         os.environ.setdefault(key, val)
+    return str(pathlib.Path(path).resolve())
+
+
+_ENDPOINT_PREFIXES = ("VPROC_OCR", "VPROC_EMBED", "VPROC_GROUNDING", "VPROC_TRANSCRIBE")
+# Every setting load_config reads, plus VPROC_ASK_URL (read by scripts/ask.sh and search.sh).
+# doctor flags other VPROC_* names as probable typos; a test keeps this in step with the
+# literals in this file.
+KNOWN_ENV = frozenset(
+    {f"{prefix}{suffix}" for prefix in _ENDPOINT_PREFIXES
+     for suffix in ("_BASE_URL", "_MODEL", "_API_KEY", "_API_KEY_FILE")}
+    | {"VPROC_INDEX_PATH", "VPROC_FRAMES_DIR", "VPROC_HOST", "VPROC_PORT", "VPROC_SIM_FLOOR",
+       "VPROC_HHEM_THRESHOLD", "VPROC_HHEM_MODEL", "VPROC_OCR_TIMEOUT", "VPROC_OCR_MAX_TOKENS",
+       "VPROC_GROUNDING_MAX_TOKENS", "VPROC_GROUNDING_THINKING", "VPROC_DIARIZE_MODEL",
+       "VPROC_SPEAKER_NAMING", "VPROC_EMBED_QUERY_PREFIX", "VPROC_ASK_URL"})
 
 
 @dataclass(frozen=True)
 class Endpoint:
     base_url: str
     model: str
+    # Optional bearer key for an authenticated server (e.g. vLLM --api-key). Kept out of
+    # repr so a logged or printed Config can never leak it.
+    api_key: str | None = field(default=None, repr=False)
 
 
 # Default ASR model for local in-process transcription (mlx-whisper on Apple Silicon).
@@ -61,13 +80,18 @@ class Config:
     ocr_timeout: float = 60.0  # per-frame OCR cap; slow vision backend -> empty screen text, not a stall
     ocr_max_tokens: int = 1024  # bound OCR output so a reasoning vision model can't run away
     grounding_max_tokens: int = 8192  # bound grounding thinking+JSON; a runaway truncates to an abstention
-    # Thinking ON = better answers, ~60-90s/question on a reasoning model; OFF = seconds,
-    # but measurably worse grounding (an answerable question flipped to abstention in A/B).
+    # Thinking ON = ~60-90s/question on a reasoning model; OFF = seconds. ON won a small A/B on
+    # a 9B model (OFF flipped an answerable question to abstention); the trade-off is
+    # model-specific, and the HHEM gate and citation rules are identical in both modes.
     grounding_thinking: bool = True
     # Speaker diarization pipeline (HF-gated; uses hf_token). Empty string = disabled.
     diarize_model: str = DEFAULT_DIARIZE_MODEL
     # Nameplate speaker naming (needs diarization + the vision endpoint). Off = keep SPEAKER_xx.
     speaker_naming: bool = True
+    # Prepended to search/ask queries before embedding; stored passages are untouched, so
+    # changing it needs no re-ingest. Instruction-tuned embedders document one (Qwen3-Embedding:
+    # "Instruct: <task>\nQuery: "). It shifts similarity values: re-check sim_floor after changing it.
+    embed_query_prefix: str = ""
 
     def __post_init__(self) -> None:
         for name, minimum, maximum in (("sim_floor", -1, 1), ("hhem_threshold", 0, 1)):
@@ -87,12 +111,29 @@ class Config:
         for name in ("index_path", "frames_dir", "host", "hhem_model"):
             _required_string(name, getattr(self, name))
         _required_string("diarize_model", self.diarize_model, allow_empty=True)
+        if not isinstance(self.embed_query_prefix, str) or "\0" in self.embed_query_prefix:
+            raise ValueError("embed_query_prefix must be a string without NUL characters")
         for name in ("ocr", "embed", "grounding", "transcribe"):
             endpoint = getattr(self, name)
             if not isinstance(endpoint, Endpoint):
                 raise ValueError(f"{name} must be an Endpoint")
             _required_string(f"{name}.model", endpoint.model)
-            _required_string(f"{name}.base_url", endpoint.base_url, allow_empty=name == "transcribe")
+            # Empty = feature off: local in-process ASR, or no OCR / nameplate naming.
+            _required_string(f"{name}.base_url", endpoint.base_url,
+                             allow_empty=name in ("transcribe", "ocr"))
+            key = endpoint.api_key
+            if key is not None and (not isinstance(key, str) or not key
+                                    or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in key)):
+                raise ValueError(f"{name}.api_key must be a nonblank string without whitespace")
+            if key is not None and self.api_key_for(endpoint.base_url) != key:
+                raise ValueError("Endpoints sharing a base URL are configured with different API keys")
+
+    def api_key_for(self, base_url: str) -> str | None:
+        """A key belongs to a server, not a function: endpoints sharing a base URL (one vLLM
+        serving OCR and grounding) share its key, so setting it once is enough."""
+        server = base_url.rstrip("/")
+        return next((ep.api_key for ep in (self.ocr, self.embed, self.grounding, self.transcribe)
+                     if ep.base_url.rstrip("/") == server and ep.api_key is not None), None)
 
 
 def _required_string(name: str, value: str, *, allow_empty: bool = False) -> None:
@@ -101,10 +142,27 @@ def _required_string(name: str, value: str, *, allow_empty: bool = False) -> Non
     raise ValueError(f"{name} must be a nonblank string without NUL characters")
 
 
+def _api_key(prefix: str) -> str | None:
+    """Inline key, or a file so the secret can live outside .env (e.g. a 0600 file shared
+    with other clients). Errors name the setting, never the value."""
+    key, file_key = f"{prefix}_API_KEY", f"{prefix}_API_KEY_FILE"
+    value, path = os.environ.get(key, "").strip(), os.environ.get(file_key, "").strip()
+    if value and path:
+        raise ValueError(f"Set only one of {key} and {file_key}")
+    if path:
+        try:
+            value = pathlib.Path(path).expanduser().read_text(encoding="utf-8-sig").strip()
+        except (OSError, UnicodeError):
+            raise ValueError(f"{file_key} must name a readable UTF-8 text file") from None
+        if not value:
+            raise ValueError(f"{file_key} names an empty file")
+    return value or None
+
+
 def _ep(prefix: str, default_url: str, default_model: str) -> Endpoint:
     key = f"{prefix}_BASE_URL"
     base_url = os.environ.get(key, default_url)
-    if not (prefix == "VPROC_TRANSCRIBE" and base_url == ""):
+    if not (prefix in ("VPROC_TRANSCRIBE", "VPROC_OCR") and base_url == ""):
         # Validate deployment URLs here; direct Config callers may inject local/fake clients.
         try:
             url = urlsplit(base_url)
@@ -117,7 +175,7 @@ def _ep(prefix: str, default_url: str, default_model: str) -> Endpoint:
             valid = False
         if not valid:
             raise ValueError(f"{key} must be an http/https base URL without a query or fragment")
-    return Endpoint(base_url, os.environ.get(f"{prefix}_MODEL", default_model))
+    return Endpoint(base_url, os.environ.get(f"{prefix}_MODEL", default_model), _api_key(prefix))
 
 
 def _bool_env(key: str, default: str = "on") -> bool:
@@ -157,4 +215,6 @@ def load_config() -> Config:
         grounding_thinking=_bool_env("VPROC_GROUNDING_THINKING"),
         diarize_model=os.environ.get("VPROC_DIARIZE_MODEL", DEFAULT_DIARIZE_MODEL),
         speaker_naming=_bool_env("VPROC_SPEAKER_NAMING"),
+        # .env values are single-line: a literal "\n" stands for the newline such prefixes need.
+        embed_query_prefix=os.environ.get("VPROC_EMBED_QUERY_PREFIX", "").replace("\\n", "\n"),
     )

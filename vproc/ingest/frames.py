@@ -21,7 +21,8 @@ def ffmpeg_sample_cmd(video: str, out_dir: str, log_path: str, scene: float = 0.
     log_value = "".join("\\" + c if c in "\\':" else c for c in log_path)
     log_value = "".join("\\" + c if c in "\\'[],;" else c for c in log_value)
     vf = f"mpdecimate,select='eq(n,0)+gt(scene,{scene})',metadata=print:file={log_value}"
-    return ["ffmpeg", "-hide_banner", "-nostdin", "-i", video, "-vf", vf,
+    # -loglevel error: the per-second progress line floods a logged ingest; errors still print.
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", video, "-vf", vf,
             "-fps_mode", "vfr", "-frame_pts", "1", f"{out_dir}/%08d.png"]
 
 

@@ -1,19 +1,38 @@
 import base64
+import logging
 import math
 import mimetypes
 import wave
 
-from openai import OpenAI
+from openai import BadRequestError, OpenAI, Timeout, UnprocessableEntityError
 
-_clients: dict[str, OpenAI] = {}
+logger = logging.getLogger(__name__)
+_clients: dict[tuple[str, str], OpenAI] = {}
+_api_keys: dict[str, str] = {}
+
+
+def configure(cfg) -> None:
+    """Register the configured bearer keys by base URL. Entry points call this once with
+    their Config; call sites keep passing plain (base_url, model) pairs."""
+    key_for = getattr(cfg, "api_key_for", None)
+    if key_for is None:
+        return  # direct stand-in configs (tests, embedders) inject their own clients
+    for ep in (cfg.ocr, cfg.embed, cfg.grounding, cfg.transcribe):
+        key = key_for(ep.base_url)
+        if key is None:
+            _api_keys.pop(ep.base_url.rstrip("/"), None)
+        else:
+            _api_keys[ep.base_url.rstrip("/")] = key
 
 
 def _client(base_url: str) -> OpenAI:
-    # api_key is required by the SDK but unused by local servers. Cache one client per
-    # base_url so the httpx connection pool is reused instead of leaking a socket per call.
-    inst = _clients.get(base_url)
+    # The SDK requires an api_key; keyless local servers ignore the placeholder. Cache one
+    # client per (base_url, key) so the httpx connection pool is reused instead of leaking
+    # a socket per call, and a client built before configure() is never reused with a stale key.
+    key = _api_keys.get(base_url.rstrip("/"), "not-needed")
+    inst = _clients.get((base_url, key))
     if inst is None:
-        inst = _clients[base_url] = OpenAI(base_url=base_url, api_key="not-needed")
+        inst = _clients[(base_url, key)] = OpenAI(base_url=base_url, api_key=key)
     return inst
 
 
@@ -49,6 +68,10 @@ def embed_texts(base_url: str, model: str, texts: list[str]) -> list[list[float]
     return out
 
 
+CHAT_TIMEOUT = 600.0  # read window for slow reasoning models (the SDK default, made explicit)
+CONNECT_TIMEOUT = 5.0
+
+
 def chat_json(
     base_url: str,
     model: str,
@@ -75,7 +98,13 @@ def chat_json(
     # think=False additionally disables the thinking channel entirely (hybrid models like
     # Qwen3.5); non-thinking backends ignore the template kwarg.
     extra = {} if think else {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-    resp = _client(base_url).chat.completions.create(
+    # No SDK retries: a generation that timed out or 5xx'd is usually still running, and a
+    # resubmission queues the same minutes-long request behind itself on a shared or
+    # single-sequence server. A bare float would also stretch the connect timeout, so an
+    # unreachable host keeps failing in seconds.
+    resp = _client(base_url).with_options(
+        timeout=Timeout(CHAT_TIMEOUT, connect=CONNECT_TIMEOUT), max_retries=0,
+    ).chat.completions.create(
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=temperature,
@@ -83,7 +112,16 @@ def chat_json(
         max_tokens=max_tokens,
         **extra,
     )
-    msg = resp.choices[0].message
+    choice = resp.choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        # Cut off at max_tokens (usually a runaway thinking channel). Whatever sits in the
+        # reasoning channel is a draft, never the answer; callers treat "" as an abstention.
+        # Counts only: generated content must not reach logs.
+        logger.warning("Generation by %s hit max_tokens=%s (completion tokens: %s); "
+                       "treated as no answer", model, max_tokens,
+                       getattr(getattr(resp, "usage", None), "completion_tokens", "unknown"))
+        return ""
+    msg = choice.message
     # Some thinking models (e.g. Qwen3 via LM Studio) emit the constrained JSON into the
     # reasoning channel and leave `content` empty; fall back to reasoning_content.
     return msg.content or getattr(msg, "reasoning_content", None) or ""
@@ -94,23 +132,65 @@ def _wav_duration(path: str) -> float:
         return w.getnframes() / float(w.getframerate())
 
 
+def _word(w) -> dict:
+    get = w.get if isinstance(w, dict) else lambda key: getattr(w, key, None)
+    return {"start": float(get("start")), "end": float(get("end")), "word": str(get("word") or "")}
+
+
+def _attach_words(out: list[dict], segs, flat) -> None:
+    """Add a "words" list to each segment dict that has them. faster-whisper style servers nest
+    words in their segment; OpenAI-style servers return one flat list, filed here under the
+    segment whose text it spells, in order. Anything unexpected just leaves words off."""
+    from vproc.ingest.transcribe import squash
+
+    try:
+        nested = [getattr(s, "words", None) for s in segs]
+        if any(nested):
+            for seg, words in zip(out, nested):
+                if words:
+                    seg["words"] = [_word(w) for w in words]
+            return
+        pending = [_word(w) for w in flat or []]
+        for seg in out:
+            target, spelled, taken = squash(seg["text"]), "", []
+            while pending and len(spelled) < len(target):
+                taken.append(pending.pop(0))
+                spelled += squash(taken[-1]["word"])
+            if spelled != target:
+                return  # misaligned from here on; earlier segments keep their words
+            if taken:
+                seg["words"] = taken
+    except (TypeError, ValueError):
+        return
+
+
 def transcribe_audio(base_url: str, model: str, audio_path: str) -> dict:
     """Transcribe via an OpenAI-compatible ASR endpoint (/v1/audio/transcriptions).
     Returns the same {"segments": [{start, end, text}]} shape as the local whisper path."""
-    with open(audio_path, "rb") as f:
-        # Hour-long meetings exceed the SDK's 600s default; max_retries=0 so a slow response
-        # doesn't silently re-upload the ~100MB wav two more times.
-        resp = _client(base_url).with_options(timeout=3600, max_retries=0).audio.transcriptions.create(
-            model=model, file=f, response_format="verbose_json"
-        )
+    def create(**extra):
+        with open(audio_path, "rb") as f:
+            # Hour-long meetings exceed the SDK's 600s default; max_retries=0 so a slow response
+            # doesn't silently re-upload the ~100MB wav two more times.
+            return _client(base_url).with_options(timeout=3600, max_retries=0).audio.transcriptions.create(
+                model=model, file=f, response_format="verbose_json", **extra)
+
+    try:
+        # Word times let diarization attribute speakers per sentence instead of per segment.
+        resp = create(timestamp_granularities=["word", "segment"])
+    except (BadRequestError, UnprocessableEntityError):
+        resp = create()  # strict server without word timestamps: whole-segment attribution
     segs = getattr(resp, "segments", None) or []
     if segs:
-        return {"segments": [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in segs]}
+        out = [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in segs]
+        _attach_words(out, segs, getattr(resp, "words", None))
+        return {"segments": out}
     # Backends that downgrade verbose_json return only `text`; synthesize one segment
     # spanning the whole recording rather than dropping the transcript. No text = true silence.
     text = (getattr(resp, "text", None) or "").strip()
     if not text:
         return {"segments": []}
+    logger.warning("ASR backend returned no segment timestamps: the whole transcript becomes ONE "
+                   "chunk with one speaker. Use a server that supports response_format=verbose_json.")
     return {"segments": [{"start": 0.0, "end": _wav_duration(audio_path), "text": text}]}
 
 
@@ -124,7 +204,9 @@ def ocr_image(base_url: str, model: str, image_path: str, prompt: str,
     # burns the whole context (65k tokens over many minutes) and returns no text. Bounded
     # timeout + no retries so a slow frame degrades (caller falls back to empty on_screen_text)
     # instead of stalling the ingest. chat_template_kwargs is ignored by non-thinking backends.
-    resp = _client(base_url).with_options(timeout=timeout, max_retries=0).chat.completions.create(
+    resp = _client(base_url).with_options(
+        timeout=Timeout(timeout, connect=CONNECT_TIMEOUT), max_retries=0,
+    ).chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": [
             {"type": "text", "text": prompt},

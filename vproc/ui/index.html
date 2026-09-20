@@ -32,9 +32,12 @@
     </select>
     <input id="qa-input" placeholder="Ask across all meetings…" aria-label="Question or search across all meetings" autocomplete="off">
     <button id="qa-go" type="button">Go</button>
+    <button id="qa-stop" type="button" hidden>Stop waiting</button>
     <span id="qa-spinner" hidden aria-hidden="true"></span>
+    <span id="qa-status" role="status"></span>
+    <span id="qa-elapsed" aria-hidden="true"></span>
   </div>
-  <div id="qa-results"></div>
+  <div id="qa-results" aria-live="polite"></div>
 </footer>
 <script type="module" src="/app.js"></script>
 </body>

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from vproc.answer.ask import ask_memory, search_memory
 from vproc.config import load_config
 from vproc.errors import IndexBusyError, IndexCompatibilityError
+from vproc.llm import client
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +75,17 @@ def _backend(call):
             status, detail = 500, "Request failed. Check the service logs and retry."
         # SDK exception messages can contain response bodies or authenticated URLs.
         # MCP also logs surfaced tool errors, so only expose these fixed messages.
-        logger.warning("Request failed (%s)", type(exc).__name__)
+        # The exception class plus the backend's HTTP status (an integer) is safe to log.
+        backend_status = getattr(exc, "status_code", None)
+        logger.warning("Request failed (%s%s)", type(exc).__name__,
+                       f", backend HTTP {backend_status}" if isinstance(backend_status, int) else "")
         raise HTTPException(status_code=status, detail=detail) from None
 
+
+_VERIFIER_UNAVAILABLE = (
+    "Answer verifier (HHEM) could not be loaded. Check that the answer extra is installed, "
+    "HF_TOKEN is valid or unset, network access for the first download, and VPROC_HHEM_MODEL."
+)
 
 _VIDEO_TYPES = {"mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime",
                 "mkv": "video/x-matroska", "webm": "video/webm"}
@@ -84,26 +93,48 @@ _VIDEO_TYPES = {"mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime"
 
 def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_memory) -> FastAPI:
     cfg = cfg or load_config()
+    client.configure(cfg)
     if store is None:
         from vproc.store.lancedb_store import Store
         store = Store(cfg.index_path)
+    verifier_state = None  # stays None with an injected scorer: nothing local to load
+    ensure_verifier = None
     if scorer is None:
         verifier = None
         verifier_lock = Lock()
+        verifier_state = "not_loaded"
 
-        def scorer(premise, hypothesis):
-            nonlocal verifier
+        def ensure_verifier():
+            nonlocal verifier, verifier_state
             # Browsing/search need no local verifier. Serialize both its first load
             # and inference because REST and MCP may score on different threads.
             with verifier_lock:
                 if verifier is None:
                     from vproc.answer.faithfulness import HHEM
-                    verifier = HHEM(cfg.hhem_model)
-                return verifier.score(premise, hypothesis)
+                    try:
+                        verifier = HHEM(cfg.hhem_model)
+                    except Exception as exc:
+                        # Not latched: a failed load is quick, so the next ask retries and a
+                        # fixed token/network needs no restart. Exception text may hold URLs
+                        # or tokens; log the type only and answer with fixed guidance.
+                        verifier_state = "failed"
+                        logger.warning("Answer verifier failed to load (%s)", type(exc).__name__)
+                        raise HTTPException(status_code=503, detail=_VERIFIER_UNAVAILABLE) from None
+                    verifier_state = "ready"
+                return verifier
+
+        def scorer(premise, hypothesis):
+            loaded = ensure_verifier()
+            with verifier_lock:
+                return loaded.score(premise, hypothesis)
 
     def ask_route(q: Query):
         question = _query_text(q.question, "question")
         where = build_where(q)
+        if ensure_verifier is not None:
+            # Load the gate BEFORE the (possibly minutes-long) generation: a verifier that
+            # cannot load must fail in seconds, not after every full generation.
+            ensure_verifier()
         return _backend(lambda: ask(store, cfg, question, scorer, where=where).model_dump())
 
     def search_route(q: Query):
@@ -123,6 +154,8 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
     @app.get("/api/status")
     def api_status():
         status = {"mcp_available": mcp_app is not None, "index_compatible": None}
+        if verifier_state is not None:
+            status["verifier"] = verifier_state  # local state only; never probes or loads
         validate = getattr(store, "validate_embedding_model", None)
         if validate is not None:
             try:

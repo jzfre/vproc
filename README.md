@@ -23,14 +23,19 @@ depend on the models you select.
 | Computer | Transcription setup | Installation boundary |
 | --- | --- | --- |
 | Apple Silicon Mac | Local MLX Whisper, or an ASR endpoint | Use a native arm64 Python and macOS 14 or newer. |
-| Windows x64 / Linux x64 | Configure an OpenAI-compatible ASR endpoint | vproc does not package a local ASR engine for these platforms. |
+| Windows x64 / Linux x64 | Configure an OpenAI-compatible ASR endpoint | vproc does not package an in-process ASR engine for these platforms. `scripts/local_models.py` is an optional CPU server for ASR and embeddings (see below). |
 | Intel Mac | A remote ASR endpoint would be needed | Unsupported by the current locked distribution: LanceDB and the local-model dependencies lack compatible Intel Mac wheels. |
 
 vproc's packaged `local-asr` extra is restricted to Apple Silicon macOS. The
 [MLX installation requirements](https://ml-explore.github.io/mlx/build/html/install.html)
 explain the native Python/macOS requirements. Locked Python 3.12 binary-wheel
-resolution has been checked for Windows x64 and Linux x64. Native end-to-end
-testing on those systems has not been performed for this release.
+resolution has been checked for Windows x64 and Linux x64. The source checkout
+has been run end to end on Linux x64 (CPU models, remote LLM); Windows has not.
+
+On Linux the lock takes **PyTorch's CPU wheels** (`torch`, `torchaudio`,
+`torchcodec` from `download.pytorch.org/whl/cpu`). vproc has no CUDA code path,
+PyPI's Linux `torch` would add about 5 GB of CUDA libraries, and PyPI's Linux
+`torchcodec` cannot load without them. macOS resolution is unchanged.
 
 ### Install uv and FFmpeg
 
@@ -61,9 +66,10 @@ sudo apt install ffmpeg
 For Windows and other Linux distributions, use the executable/package links
 on the [official FFmpeg download page](https://ffmpeg.org/download.html).
 On Windows, extract a **shared** build and add its `bin` directory to `PATH`.
-Diarization uses TorchCodec, which also needs FFmpeg's shared libraries; a
-standalone static `ffmpeg.exe` can pass the command check while diarization
-still fails. See [TorchCodec installation](https://github.com/meta-pytorch/torchcodec#installing-torchcodec).
+vproc decodes audio with the `ffmpeg` executable and hands diarization the
+samples in memory, so pyannote's TorchCodec decoder is not needed; if TorchCodec
+cannot load FFmpeg's shared libraries, pyannote prints a warning at import that
+can be ignored.
 
 Verify in the terminal that will run vproc:
 
@@ -133,17 +139,28 @@ or another host; `localhost` always refers to the computer running vproc.
 
 | Settings | Backend capability | Used for |
 | --- | --- | --- |
-| `VPROC_OCR_BASE_URL`, `VPROC_OCR_MODEL` | OpenAI-compatible chat completions with image input | On-screen text and speaker nameplates |
-| `VPROC_EMBED_BASE_URL`, `VPROC_EMBED_MODEL` | OpenAI-compatible embeddings | Ingest, search, and retrieval for answers |
+| `VPROC_OCR_BASE_URL`, `VPROC_OCR_MODEL` | OpenAI-compatible chat completions with image input | On-screen text and speaker nameplates. Set `VPROC_OCR_BASE_URL=` (empty) to switch both off, for example when only a text-only LLM is available |
+| `VPROC_EMBED_BASE_URL`, `VPROC_EMBED_MODEL`, optional `VPROC_EMBED_QUERY_PREFIX` | OpenAI-compatible embeddings | Ingest, search, and retrieval for answers |
 | `VPROC_GROUNDING_BASE_URL`, `VPROC_GROUNDING_MODEL` | OpenAI-compatible chat completions with structured JSON output | Answers grounded in retrieved evidence |
 | `VPROC_TRANSCRIBE_BASE_URL`, `VPROC_TRANSCRIBE_MODEL` | OpenAI-compatible audio transcriptions | Required ASR mode on Windows and Linux; optional on Apple Silicon |
 
 Use base URLs such as `http://localhost:8000/v1`, not the full
-`/chat/completions` or `/audio/transcriptions` route. The client currently
-sends the fixed API key `not-needed`; it expects self-hosted endpoints or a
-proxy that accepts this value. There is no configurable provider API-key
-setting. Meeting audio, images, or text are sent to the endpoints configured
-for each operation.
+`/chat/completions` or `/audio/transcriptions` route. Keyless self-hosted
+servers need nothing more: the client sends the placeholder key `not-needed`.
+For a server that requires a bearer key (for example `vllm serve --api-key`),
+set one of these for any endpoint prefix (`VPROC_OCR`, `VPROC_EMBED`,
+`VPROC_GROUNDING`, `VPROC_TRANSCRIBE`):
+
+```dotenv
+VPROC_GROUNDING_API_KEY_FILE=~/.config/my-llm/api-key
+# or inline: VPROC_GROUNDING_API_KEY=your-key
+```
+
+Prefer the file form with mode `0600` so the secret stays out of `.env`. A key
+applies to its server: endpoints sharing a base URL share it, and two different
+keys for one base URL are rejected at startup. Keys are never printed or logged.
+Meeting audio, images, or text are sent to the endpoints configured for each
+operation.
 
 For endpoint transcription, set these values to your ASR server and model:
 
@@ -154,10 +171,47 @@ VPROC_TRANSCRIBE_MODEL=replace-with-your-asr-model
 
 The ASR server should support `response_format=verbose_json` with timestamped
 segments. Text-only responses become one segment spanning the recording,
-which loses precise transcript timing. On Apple Silicon, leave the ASR base
-URL empty to use local MLX and retain the MLX model ID from `.env.example`.
-First use downloads that model from Hugging Face, as described by
+which loses precise transcript timing (ingest warns when this happens). vproc
+also asks for word timestamps (`timestamp_granularities`). With them, speakers
+are attributed sentence by sentence: each sentence goes to whoever spoke most
+of it, a sentence may continue across an ASR segment boundary, and chunks end
+on sentence boundaries. Without them (or without punctuation) a whole ASR
+segment goes to the speaker who overlaps it most. A server that rejects the
+parameter is retried without it. On Apple Silicon, leave the ASR base URL empty
+to use local MLX and retain the MLX model ID from `.env.example`. First use
+downloads that model from Hugging Face, as described by
 [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper).
+
+`scripts/local_models.py` is an optional single-process CPU server for hosts
+with no ASR or embedding backend (for example a Linux box whose GPU is fully
+used by an LLM server). It serves faster-whisper transcription with word
+timestamps and sentence-transformers embeddings on `127.0.0.1:8011`, with its
+dependencies locked in `scripts/local_models.py.lock`:
+
+```sh
+uv run --locked --script scripts/local_models.py
+```
+
+```dotenv
+VPROC_TRANSCRIBE_BASE_URL=http://127.0.0.1:8011/v1
+VPROC_TRANSCRIBE_MODEL=large-v3-turbo
+VPROC_EMBED_BASE_URL=http://127.0.0.1:8011/v1
+VPROC_EMBED_MODEL=Qwen/Qwen3-Embedding-0.6B
+```
+
+A git checkout (not the source release) also has `deploy/systemd/` user-unit
+templates for it and for `vproc serve`. The script has been run on Linux only.
+
+Instruction-tuned embedding models document a prefix for queries. Set it with
+`VPROC_EMBED_QUERY_PREFIX` (quote the value to keep a trailing space; write a
+newline as `\n`). It is applied to search/ask queries only, so changing it
+needs no re-ingest, but it shifts similarity values: re-check
+`VPROC_SIM_FLOOR`, which is specific to an embedding model and mainly filters
+off-topic questions. For Qwen3-Embedding:
+
+```dotenv
+VPROC_EMBED_QUERY_PREFIX="Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+```
 
 Diarization is enabled in the example configuration. To use the default
 `pyannote/speaker-diarization-community-1` model:
@@ -176,8 +230,9 @@ To disable diarization and automatic speaker naming, set
 failures produce warnings and can reduce the resulting evidence.
 
 Answer verification runs locally using
-`vectara/hallucination_evaluation_model`. HHEM loads only when an answer first
-needs checking and may download weights and model code from Hugging Face.
+`vectara/hallucination_evaluation_model`. HHEM loads on the first ask, before
+the answer is generated (browsing and search never load it), and may download
+weights and model code from Hugging Face.
 The implementation enables `trust_remote_code=True`; use a trusted model
 repository if changing `VPROC_HHEM_MODEL`. Installing `runtime` does not
 pre-download any model weights or create model servers.
@@ -190,13 +245,20 @@ From the same directory containing `.env`:
 uv run --no-sync vproc --version
 uv run --no-sync vproc --help
 uv run --no-sync vproc doctor
+uv run --no-sync vproc doctor --online
 uv run --no-sync vproc ingest "meeting.mp4"
 uv run --no-sync vproc serve
 ```
 
 Replace `meeting.mp4` with a real recording path; quote paths containing
 spaces. `doctor` checks local prerequisites without contacting model servers,
-loading models, or downloading weights. Missing required local prerequisites
+loading models, or downloading weights. It also prints which `.env` was loaded,
+each endpoint's URL and model, and any `VPROC_*` name it does not recognize.
+`doctor --online` additionally sends tiny requests to every configured server
+(reachability, rejected API key, model id, embedding dimension against the
+index, a one-word chat reply) and checks that `HF_TOKEN` is valid and has access
+to the diarization model. Run it before a long ingest: an ingest otherwise
+discovers a bad token or key minutes in. Missing required local prerequisites
 return a nonzero exit status. A successful check does not establish endpoint
 reachability, model access, or real-model quality. A base-only install can
 still browse/search even when `doctor` reports missing answer dependencies.
@@ -216,8 +278,11 @@ Invoke-RestMethod http://localhost:8765/healthz
 Invoke-RestMethod http://localhost:8765/api/status
 ```
 
-The CLI commands are `ingest`, `serve`, `speakers`, and `doctor`; ask/search
-are HTTP endpoints exposed through the UI. The source release also includes
+The CLI commands are `ingest`, `serve`, `analyze`, `speakers`, and `doctor`;
+ask/search are HTTP endpoints (`POST /ask`, `POST /search`; the running service
+describes itself at `/docs` and `/openapi.json`) exposed through the UI.
+`vproc speakers "<memory>"` lists each speaker label with talk time and sample
+quotes, so you can tell who `SPEAKER_01` is and rename them with `--set`. The source release also includes
 Bash helpers for macOS/Linux:
 
 ```sh
@@ -235,6 +300,9 @@ then run:
 uv venv --python 3.12
 uv pip install "./vproc-0.1.0-py3-none-any.whl[runtime]"
 ```
+
+On Linux add `--torch-backend cpu` to that `uv pip install` command: the CPU
+wheel source lives in the project's uv settings, which a wheel does not carry.
 
 Copy and configure `.env` as above. On macOS/Linux run `.venv/bin/vproc doctor`
 and `.venv/bin/vproc serve`; in Windows PowerShell use
@@ -276,6 +344,14 @@ speaker-map backups and reapply any manual corrections after re-ingestion.
 - A memory is identified by its video filename stem within a project. Ingesting
   another `standup.mp4` in the same project replaces that memory, even if the
   source directory differs. Use distinct filenames for distinct meetings.
+- Ingest first proves the embedding backend works and matches the index, then
+  prints one `[ingest] <stage>: ...` line per finished stage on stderr, with
+  percentage lines during diarization (the longest stage). A run whose
+  best-effort stages failed ends with one `[ingest] DEGRADED: ...` summary.
+- A failed diarization normally degrades to an unlabelled transcript, but it
+  never replaces a memory that already has speaker labels: that re-ingest
+  stops with an error. Fix diarization or set `VPROC_DIARIZE_MODEL=`.
+- Only screenshots that an index row references are stored.
 - Re-ingest writes new screenshot filenames before replacing index rows. Failed
   embedding or index writes preserve the previous screenshots; a zero-segment
   extraction leaves the previous memory intact and emits a CLI warning.
@@ -293,6 +369,30 @@ speaker-map backups and reapply any manual corrections after re-ingestion.
   and MCP requests may narrow results with `project`, `memory`, and `speaker`
   filters. Queries are limited to 8,192 characters; filters to 128 characters
   without control characters.
+- Answers take seconds with `VPROC_GROUNDING_THINKING=off` and can take a minute
+  or more with it on, on a reasoning model. The HHEM gate and citation rules are
+  the same in both modes; the default (`on`) was tuned on a 9B model. The UI
+  shows elapsed time and offers "Stop waiting", which ends the wait but cannot
+  cancel the generation. MCP clients need a tool-call timeout above the ask
+  latency (for Claude Code: `MCP_TOOL_TIMEOUT`; progress notifications do not
+  extend it); use the search tool for quick lookups. Grounding requests are
+  never retried automatically, so a slow answer is not submitted twice.
+- An answer has at most six claims. With thinking off, set
+  `VPROC_GROUNDING_MAX_TOKENS` to about 2048: it bounds the rare runaway
+  generation, which ends as an abstention and is logged as hitting `max_tokens`.
+- An abstained answer always reads "Not discussed in these meetings.", which
+  means no verified answer was found, not proof the subject never came up. The
+  response also carries `abstain_reason` (`no_hits`, `low_similarity`,
+  `no_answer`, `unverified`), `top_sim` (the best cosine measured, before any
+  keyword lift of the gate), and the verifier's `hhem_scores`, for
+  tuning `VPROC_SIM_FLOOR` and `VPROC_HHEM_THRESHOLD`. Search hits carry
+  `similarity` (cosine; values differ per embedding model) and `keyword_match`
+  (the segment's spoken or on-screen text, or its speaker label, contains every
+  word of the query): search always returns the nearest segments, even for a
+  word that appears nowhere.
+- The answer verifier (HHEM) loads before the first generation. If it cannot
+  load, ask returns a 503 that says so, and `/api/status` reports
+  `"verifier": "failed"` (`not_loaded`, `ready` otherwise).
 - Citation times and speaker labels come from indexed evidence. Transcription,
   OCR, speaker attribution, and faithfulness scoring can still be wrong; verify
   consequential answers against the recording.
@@ -337,12 +437,16 @@ Use the source checkout or source release. Node.js is needed only for the UI
 tests below. Install the development dependencies first:
 
 ```sh
-uv sync --locked --python 3.12
+uv sync --locked --extra runtime --python 3.12
 uv run --no-sync pytest -q
 node --test tests/test_ui.cjs
 uv run --no-sync ruff check vproc
 uv build
 ```
+
+`uv sync` is exact: without `--extra runtime` it removes PyTorch, pyannote and
+Transformers from `.venv`, which breaks a service or ingest running from the
+same checkout. The tests themselves need only the base install.
 
 `uv build` writes the source archive and wheel to `dist/`. The source archive
 includes `uv.lock`, `.env.example`, README, helper scripts, and tests. Transfer
@@ -386,4 +490,8 @@ VPROC_HOST=127.0.0.1
 
 in `.env` for a localhost-only service. For LAN access, keep `0.0.0.0` and
 restrict incoming access to the configured port with the host firewall.
+Binding to a single VPN address (for example a Tailscale IP) keeps the service
+private to that network, but `localhost` then stops working: set
+`VPROC_ASK_URL=http://<that address>:8765` for the helper scripts, or bind
+`127.0.0.1` and publish it with a VPN-only reverse proxy.
 Do not expose this unauthenticated service directly to the internet.

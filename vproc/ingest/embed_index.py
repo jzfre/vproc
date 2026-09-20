@@ -12,6 +12,15 @@ def _row(seg: Segment, vector: list[float]) -> dict:
     }
 
 
+def preflight(cfg, store, embed=client.embed_texts) -> None:
+    """Prove the embedding backend works and matches the index BEFORE minutes of ASR and
+    diarization: it is the one ingest dependency that otherwise fails last."""
+    vectors = embed(cfg.embed.base_url, cfg.embed.model, ["vproc ingest preflight"])
+    if len(vectors) != 1:
+        raise ValueError(f"Expected one preflight embedding, received {len(vectors)}")
+    store.validate_embedding_model(cfg.embed.model, len(vectors[0]))
+
+
 def embed_rows(cfg, segments: list[Segment], embed=client.embed_texts) -> list[dict]:
     """Build rows without writing, so failed embedding leaves prior index data intact."""
     if not segments:

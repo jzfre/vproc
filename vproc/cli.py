@@ -4,17 +4,18 @@ from pathlib import Path
 import tomllib
 
 from vproc.config import load_config, load_dotenv
-from vproc.errors import IndexBusyError
+from vproc.errors import IndexBusyError, IngestError
 from vproc.locking import IndexWriteLock
 from vproc.paths import memory_directory
 
-USAGE = """usage: vproc [ingest <video.mp4> | serve | analyze <memory> "<question>" | speakers <memory> [--set 'SPEAKER_XX=Name'] | doctor]
+USAGE = """usage: vproc [ingest <video.mp4> | serve | analyze <memory> "<question>" | speakers <memory> [--set 'SPEAKER_XX=Name'] | doctor [--online]]
 
   ingest     Transcribe and index a video.
   serve      Start the HTTP and MCP service.
   analyze    Ask a freeform question about a whole meeting transcript (summary, todos, topics).
   speakers   List or rename speakers in a memory.
-  doctor     Check local installation prerequisites offline.
+  doctor     Check local installation prerequisites offline; --online also probes the
+             configured model servers and Hugging Face access before a long ingest.
   --help     Show this help.
   --version  Show the installed version.
 """
@@ -74,8 +75,19 @@ def _speakers(args: list[str]) -> None:
     try:
         m = N.load_speaker_map(mem_dir)
     except FileNotFoundError:
+        m = None
+    # Opening a store creates its directory; listing must not do that for a missing index.
+    rows = (_store_for(cfg).memory_rows(memory, "default")
+            if Path(cfg.index_path).expanduser().exists() else [])
+    # OCR-only chunks (silent slides) carry a placeholder label and are nobody's talk time.
+    rows = [r for r in rows if (r.get("said_text") or "").strip()]
+    if m is None and not rows:
         print(f"no speaker map for '{memory}' (expected {mem_dir}/speakers.json)")
         return
+    _print_speaker_summary(rows)
+    if rows:
+        print(f"rename with: vproc speakers \"{memory}\" --set 'SPEAKER_XX=Name'")
+    m = m or {}
     for spk, name in sorted(m.get("mapping", {}).items()):
         print(f"{spk} = {name}")
     for spk, s in sorted(m.get("suggestions", {}).items()):
@@ -85,10 +97,31 @@ def _speakers(args: list[str]) -> None:
             print(f"    seen at {ev['t']}s: {ev['name']}")
 
 
+def _print_speaker_summary(rows: list[dict]) -> None:
+    """Talk time and the two longest quotes per label: enough to tell who a SPEAKER_xx is
+    (open the UI at the timestamp) when nothing named the speakers automatically."""
+    from vproc.models import mmss
+
+    by_speaker: dict[str, list[dict]] = {}
+    for r in rows:
+        by_speaker.setdefault(r.get("speaker", "SPEAKER_0"), []).append(r)
+
+    def talk(items: list[dict]) -> float:
+        return sum(r["end_ts"] - r["start_ts"] for r in items)
+
+    for spk, items in sorted(by_speaker.items(), key=lambda kv: -talk(kv[1])):
+        print(f"{spk}: {mmss(talk(items))} talk time in {len(items)} chunks")
+        longest = sorted(items, key=lambda r: r["end_ts"] - r["start_ts"], reverse=True)[:2]
+        for r in sorted(longest, key=lambda r: r["start_ts"]):
+            words = (r.get("said_text") or "").split()
+            quote = " ".join(words[:12]) + ("..." if len(words) > 12 else "")
+            print(f"    {mmss(r['start_ts'])} \"{quote}\"")
+
+
 def main() -> None:
     try:
         _main(sys.argv[1:])
-    except (IndexBusyError, ValueError) as e:
+    except (IndexBusyError, IngestError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -100,11 +133,11 @@ def _main(args: list[str]) -> None:
     if args == ["--version"]:
         print(f"vproc {_version()}")
         return
-    load_dotenv()
-    if args == ["doctor"]:
-        from vproc.doctor import run_doctor
+    env_file = load_dotenv()
+    if args in (["doctor"], ["doctor", "--online"]):
+        from vproc import doctor
 
-        status = run_doctor(load_config())
+        status = doctor.run_doctor(load_config(), env_file=env_file, online="--online" in args)
         if status:
             sys.exit(status)
     elif len(args) == 2 and args[0] == "ingest":

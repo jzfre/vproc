@@ -32,14 +32,25 @@ async function viewer() {
     return nodes.get(id);
   };
   const requests = new Map();
+  const timers = {callbacks: [], cleared: []};
   const context = vm.createContext({
+    // Controllable timer: a real interval could keep the test process alive.
+    setInterval: (callback) => { timers.callbacks.push(callback); return timers.callbacks.length; },
+    clearInterval: (id) => { timers.cleared.push(id); },
+    AbortController,
     document: {getElementById: node, querySelector: () => null},
     window: {addEventListener() {}}, URLSearchParams,
     location: {search: '', pathname: '/'},
     history: {replaceState(_state, _title, url) { context.url = url; }},
     console,
-    fetch: async (url) => {
-      if (requests.has(url)) return requests.get(url).promise;
+    fetch: async (url, opts) => {
+      if (requests.has(url)) {
+        const pending = requests.get(url).promise;
+        if (!opts || !opts.signal) return pending;
+        return Promise.race([pending, new Promise((_, reject) => {
+          opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), {name: 'AbortError'})));
+        })]);
+      }
       if (url === '/api/memories') return response(memories);
       const match = url.match(/^\/api\/memories\/(\w+)\/segments$/);
       if (match) return response(segments(match[1]));
@@ -49,7 +60,7 @@ async function viewer() {
   vm.runInContext(app, context);
   // Boot includes both the catalog and first transcript requests.
   await new Promise((resolve) => setImmediate(resolve));
-  return {context, node, requests, state: vm.runInContext('state', context)};
+  return {context, node, requests, timers, state: vm.runInContext('state', context)};
 }
 
 const delayMeeting = (ui, id) => {
@@ -194,4 +205,83 @@ test('query mode is locked and previous results cleared until the response arriv
   assert.equal(ui.node('qa-mode').disabled, false);
   assert.equal(ui.node('qa-go').disabled, false);
   assert.match(ui.node('qa-results').innerHTML, /No matching segments/);
+});
+
+test('a long ask shows elapsed time and offers to stop waiting, then cleans up', async () => {
+  const ui = await viewer();
+  ui.node('qa-mode').value = 'ask';
+  ui.node('qa-input').value = 'who decided?';
+  ui.node('qa-stop').hidden = true;
+  const request = deferred();
+  ui.requests.set('/ask', request);
+  const query = ui.context.runQuery();
+  // The live region is announced once; the number that changes every second is a separate,
+  // silent element, or a screen reader would read out every tick and delay the result.
+  const announced = ui.node('qa-status').textContent;
+  assert.match(announced, /Answering/);
+  assert.doesNotMatch(announced, /\d/);
+  assert.match(ui.node('qa-elapsed').textContent, /^\d+ s$/);
+  assert.equal(ui.node('qa-stop').hidden, false);
+  ui.timers.callbacks[0]();  // a tick updates only the counter
+  assert.match(ui.node('qa-elapsed').textContent, /^\d+ s$/);
+  assert.equal(ui.node('qa-status').textContent, announced);
+  request.resolve(response({answered: false, abstained: true, text: 'Not discussed in these meetings.',
+    claims: [], evidence: [], abstain_reason: 'unverified'}));
+  await query;
+  assert.deepEqual(ui.timers.cleared, [1]);
+  assert.equal(ui.node('qa-status').textContent, '');
+  assert.equal(ui.node('qa-elapsed').textContent, '');
+  assert.equal(ui.node('qa-stop').hidden, true);
+  assert.equal(ui.node('qa-go').disabled, false);
+  // The fixed sentence stays; the cause is explained without showing any unverified text.
+  assert.match(ui.node('qa-results').innerHTML, /Not discussed in these meetings/);
+  assert.match(ui.node('qa-results').innerHTML, /could not be verified/);
+});
+
+test('stop waiting aborts the request, says the server may still finish, and unlocks', async () => {
+  const ui = await viewer();
+  ui.node('qa-mode').value = 'ask';
+  ui.node('qa-input').value = 'who decided?';
+  ui.requests.set('/ask', deferred());
+  const query = ui.context.runQuery();
+  ui.node('qa-stop').listeners.get('click')();
+  await query;
+  assert.match(ui.node('qa-results').innerHTML, /Stopped waiting/);
+  assert.match(ui.node('qa-results').innerHTML, /may still finish/);
+  assert.equal(ui.node('qa-go').disabled, false);
+  assert.equal(ui.node('qa-input').disabled, false);
+});
+
+test('search hits show how near they are and whether they literally match', async () => {
+  const ui = await viewer();
+  ui.node('qa-mode').value = 'search';
+  ui.node('qa-input').value = 'ERR-4127';
+  const hit = (extra) => ({memory_title: 'alpha', start_ts: 1, end_ts: 2, speaker: 'alpha', text: 't', ...extra});
+  const request = deferred();
+  ui.requests.set('/search', request);
+  let query = ui.context.runQuery();
+  request.resolve(response([hit({similarity: 0.4593, keyword_match: false})]));
+  await query;
+  assert.match(ui.node('qa-results').innerHTML, /0\.46/);
+  assert.match(ui.node('qa-results').innerHTML, /None of these results contains every word/);
+  assert.doesNotMatch(ui.node('qa-results').innerHTML, /badge-exact/);
+
+  const second = deferred();
+  ui.requests.set('/search', second);
+  query = ui.context.runQuery();
+  second.resolve(response([hit({similarity: 0.81, keyword_match: true})]));
+  await query;
+  assert.match(ui.node('qa-results').innerHTML, /badge-exact/);
+  assert.doesNotMatch(ui.node('qa-results').innerHTML, /None of these results contains every word/);
+});
+
+test('an ask that fails immediately does not claim the server is still working on it', async () => {
+  const ui = await viewer();
+  ui.node('qa-mode').value = 'ask';
+  ui.node('qa-input').value = 'who decided?';
+  ui.requests.set('/ask', {promise: Promise.reject(new TypeError('fetch failed'))});
+  await ui.context.runQuery();
+  assert.match(ui.node('qa-results').innerHTML, /is the server running/);
+  assert.doesNotMatch(ui.node('qa-results').innerHTML, /may still be finishing/);
+  assert.equal(ui.node('qa-go').disabled, false);
 });

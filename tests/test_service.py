@@ -473,3 +473,69 @@ def test_status_checks_empty_and_legacy_index_without_model_calls(tmp_path, monk
     assert "re-ingest" in status.json()["detail"].lower()
     assert client.get("/healthz").json() == {"ok": True}
     assert client.get("/api/memories").status_code == 200
+
+
+def test_create_app_registers_endpoint_api_keys(monkeypatch):
+    import vproc.service as service
+
+    seen = []
+    monkeypatch.setattr(service.client, "configure", seen.append)
+    cfg = _cfg()
+    create_app(store=object(), scorer=lambda p, h: 1.0, cfg=cfg)
+    assert seen == [cfg]
+
+
+def test_unloadable_verifier_fails_ask_before_any_generation_and_recovers(monkeypatch):
+    # The gate model loads before the (minutes-long) generation: a broken verifier must cost
+    # seconds and say so, not a full generation per ask ending in a generic 500.
+    import vproc.answer.faithfulness as faithfulness
+
+    asked = []
+    healthy = []
+
+    class Verifier:
+        def __init__(self, model):
+            if not healthy:
+                raise OSError("401 for https://huggingface.co/... token=secret-token")
+
+        def score(self, premise, hypothesis):
+            return 0.9
+
+    def answer(store, cfg, question, scorer, where=None):
+        asked.append(question)
+        return Answer(answered=True, abstained=False, text=str(scorer("e", question)),
+                      claims=[], evidence=[])
+
+    monkeypatch.setattr(faithfulness, "HHEM", Verifier)
+    app = create_app(store=_UIStore([]), cfg=_cfg(), ask=answer)
+    with TestClient(app) as client:
+        assert client.get("/api/status").json()["verifier"] == "not_loaded"
+        failed = client.post("/ask", json={"question": "first"})
+        assert failed.status_code == 503
+        assert "verifier" in failed.json()["detail"].lower()
+        assert "secret-token" not in failed.text
+        assert asked == []
+        assert client.get("/api/status").json()["verifier"] == "failed"
+        healthy.append(True)  # e.g. the token was fixed: no restart needed
+        assert client.post("/ask", json={"question": "second"}).json()["text"] == "0.9"
+        assert client.get("/api/status").json()["verifier"] == "ready"
+
+
+def test_injected_scorer_reports_no_verifier_state():
+    client = TestClient(create_app(store=_UIStore([]), cfg=_cfg(), scorer=lambda p, h: 1.0))
+    assert "verifier" not in client.get("/api/status").json()
+
+
+def test_backend_failure_log_carries_the_http_status_but_never_the_body(caplog):
+    # "InternalServerError" alone could not tell a proxy 503 from a vLLM 500.
+    request = httpx.Request("POST", "http://backend/v1/chat/completions")
+
+    def failing(store, cfg, question, scorer, where=None):
+        raise APIStatusError("secret-token response body",
+                             response=httpx.Response(503, request=request), body=None)
+
+    client = TestClient(create_app(store=object(), scorer=lambda p, h: 1.0, cfg=_cfg(), ask=failing))
+    with caplog.at_level("WARNING"):
+        assert client.post("/ask", json={"question": "q"}).status_code == 503
+    assert "APIStatusError" in caplog.text and "503" in caplog.text
+    assert "secret-token" not in caplog.text

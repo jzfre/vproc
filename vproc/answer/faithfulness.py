@@ -10,16 +10,25 @@ class HHEM:
     def __init__(self, model_id: str = HHEM_MODEL):
         from transformers import AutoModelForSequenceClassification  # lazy: heavy import
 
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_id, trust_remote_code=True
-        )
+        load = AutoModelForSequenceClassification.from_pretrained
+        try:
+            self.model = load(model_id, trust_remote_code=True)
+        except OSError:
+            # A Hub that rejects the ambient HF_TOKEN (kept for gated diarization) must not take
+            # the public default verifier down with it: retry this repo anonymously once. The
+            # model's remote code loads its foundation config/tokenizer on its own, still with
+            # the ambient token, so a cold cache can fail regardless; the service's 503 then
+            # points at HF_TOKEN. A genuinely private or missing model fails the same way again.
+            self.model = load(model_id, trust_remote_code=True, token=False)
 
     def score(self, premise: str, hypothesis: str) -> float:
         return float(self.model.predict([(premise, hypothesis)])[0])
 
 
 def filter_claims(claims: list[dict], evidence_by_key: dict[str, Evidence],
-                  scorer, threshold: float) -> list[dict]:
+                  scorer, threshold: float, scores: list[float] | None = None) -> list[dict]:
+    """Keep the claims their cited evidence supports. `scores`, when given, collects every
+    valid gate score (kept or not) so callers can report numbers without claim text."""
     kept: list[dict] = []
     for claim in claims:
         premise = "\n".join(
@@ -29,6 +38,9 @@ def filter_claims(claims: list[dict], evidence_by_key: dict[str, Evidence],
             continue
         score = scorer(premise, claim["text"])
         # A score must be a probability; invalid model output cannot verify a claim.
-        if type(score) in (int, float) and 0.0 <= score <= 1.0 and score >= threshold:
-            kept.append(claim)
+        if type(score) in (int, float) and 0.0 <= score <= 1.0:
+            if scores is not None:
+                scores.append(float(score))
+            if score >= threshold:
+                kept.append(claim)
     return kept

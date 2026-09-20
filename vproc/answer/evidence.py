@@ -14,6 +14,7 @@ def build_evidence(hits: list[dict]) -> list[Evidence]:
             key=f"E{i}", segment_id=h["id"], memory_title=h.get("memory_id", ""),
             start_ts=float(h["start_ts"]), end_ts=float(h["end_ts"]),
             speaker=h.get("speaker", "SPEAKER_0"), text=_text(h),
+            similarity=h.get("_similarity"), keyword_match=bool(h.get("_keyword_match")),
         ))
     return out
 

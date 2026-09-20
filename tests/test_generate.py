@@ -80,3 +80,20 @@ def test_generate_drops_blank_claims(text):
     raw = json.dumps({"answered": True, "claims": [{"text": text, "evidence_ids": ["E1"]}]})
     out = generate(_cfg(), "q", '[E1] "ships in July"', chat=lambda *a, **k: raw)
     assert out == {"answered": False, "claims": []}
+
+
+def test_claims_are_bounded_in_the_schema_and_in_code():
+    # Observed on a 27B model with thinking off: after answering, it kept appending claims about
+    # everything in the evidence until max_tokens (8192 tokens, 259 s) and the truncated JSON
+    # became an abstention. Constrained decoding enforces the schema bound; the slice covers
+    # backends that ignore it.
+    import json
+
+    from vproc.answer import generate as G
+
+    assert G.ANSWER_SCHEMA["properties"]["claims"]["maxItems"] == G.MAX_CLAIMS
+    many = {"answered": True, "claims": [{"text": f"claim {i}", "evidence_ids": ["E1"]} for i in range(20)]}
+    cfg = type("C", (), {"grounding": type("E", (), {"base_url": "u", "model": "m"})(),
+                         "grounding_max_tokens": 64, "grounding_thinking": False})()
+    out = G.generate(cfg, "q", "[E1] evidence", chat=lambda *a, **k: json.dumps(many))
+    assert [c["text"] for c in out["claims"]] == [f"claim {i}" for i in range(G.MAX_CLAIMS)]

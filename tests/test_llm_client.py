@@ -108,6 +108,23 @@ def test_ocr_image_builds_data_url(tmp_path, monkeypatch):
     assert cap["max_tokens"] == 1024
     assert cap["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
 
+def test_ocr_image_fails_fast_when_the_vision_host_is_unreachable(tmp_path, monkeypatch):
+    # A bare float would stretch the connect timeout too: a dead host must cost seconds per
+    # frame, not the whole per-frame read budget.
+    options = {}
+
+    class Client(_FakeClient):
+        def with_options(self, **kw):
+            options.update(kw)
+            return self
+
+    monkeypatch.setattr(c, "_client", lambda base_url: Client({}))
+    img = tmp_path / "f.png"; img.write_bytes(b"\x89PNG\r\n\x1a\n")
+    c.ocr_image("u", "m", str(img), "P", timeout=45.0)
+    assert options["timeout"].read == 45.0 and options["timeout"].connect == 5.0
+    assert options["max_retries"] == 0
+
+
 def test_ocr_image_none_content_returns_empty(tmp_path, monkeypatch):
     class _NoneChat:
         @property
@@ -136,6 +153,59 @@ def test_chat_json_think_off_disables_reasoning(monkeypatch):
     c.chat_json("u", "m", "sys", "usr", think=False)
     assert cap["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
 
+def test_chat_json_never_resubmits_a_generation(monkeypatch):
+    # A generation that times out or 5xxs was probably still running: an SDK retry would
+    # queue the same long request again behind itself on a single-sequence server.
+    options = {}
+
+    class Client(_FakeClient):
+        def with_options(self, **kw):
+            options.update(kw)
+            return self
+
+    monkeypatch.setattr(c, "_client", lambda base_url: Client({}))
+    c.chat_json("u", "m", "sys", "usr")
+    assert options["max_retries"] == 0
+    # Generous read window for slow reasoning models, but an unreachable host fails fast.
+    assert options["timeout"].read == 600.0 and options["timeout"].connect == 5.0
+
+
+def test_client_key_lookup_ignores_a_trailing_slash(monkeypatch):
+    calls = []
+    monkeypatch.setattr(c, "OpenAI", lambda **kw: calls.append(kw) or object())
+    monkeypatch.setattr(c, "_api_keys", {"http://llm/v1": "s3cret"})
+    c._clients.clear()
+    c._client("http://llm/v1/")
+    assert calls[0]["api_key"] == "s3cret"
+
+
+def _chat_client(message, finish_reason):
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+    create = lambda **kw: SimpleNamespace(  # noqa: E731
+        choices=[choice], usage=SimpleNamespace(completion_tokens=24, prompt_tokens=300))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    client.with_options = lambda **kw: client
+    return client
+
+
+def test_chat_json_truncated_generation_is_empty_and_logged(monkeypatch, caplog):
+    # A reasoning model cut off at max_tokens leaves draft JSON in its thinking channel; that
+    # draft must never be parsed as the answer, and the operator must be able to see why an
+    # answerable question abstained. Counts only: never log content.
+    message = SimpleNamespace(content=None, reasoning_content='draft {"answered": true, "claims": []}')
+    monkeypatch.setattr(c, "_client", lambda base_url: _chat_client(message, "length"))
+    with caplog.at_level("WARNING"):
+        assert c.chat_json("u", "m", "sys", "usr", max_tokens=24) == ""
+    assert "max_tokens" in caplog.text and "24" in caplog.text
+    assert "draft" not in caplog.text
+
+
+def test_chat_json_keeps_reasoning_channel_fallback_for_complete_generations(monkeypatch):
+    message = SimpleNamespace(content="", reasoning_content='{"answered": false, "claims": []}')
+    monkeypatch.setattr(c, "_client", lambda base_url: _chat_client(message, "stop"))
+    assert c.chat_json("u", "m", "sys", "usr") == '{"answered": false, "claims": []}'
+
+
 def test_client_cached_per_base_url(monkeypatch):
     calls = []
     monkeypatch.setattr(c, "OpenAI", lambda **kw: calls.append(kw) or object())
@@ -143,6 +213,52 @@ def test_client_cached_per_base_url(monkeypatch):
     a = c._client("http://x/v1"); b = c._client("http://x/v1"); d = c._client("http://y/v1")
     assert a is b and a is not d
     assert len(calls) == 2
+
+def test_client_sends_placeholder_key_by_default(monkeypatch):
+    calls = []
+    monkeypatch.setattr(c, "OpenAI", lambda **kw: calls.append(kw) or object())
+    monkeypatch.setattr(c, "_api_keys", {})
+    c._clients.clear()
+    c._client("http://x/v1")
+    assert calls[0]["api_key"] == "not-needed"  # the SDK requires a value; local servers ignore it
+
+
+def test_configure_registers_endpoint_api_keys(monkeypatch):
+    from vproc.config import Config, Endpoint
+
+    calls = []
+    monkeypatch.setattr(c, "OpenAI", lambda **kw: calls.append(kw) or object())
+    monkeypatch.setattr(c, "_api_keys", {})
+    c._clients.clear()
+    plain = Endpoint("http://x/v1", "m")
+    keyed = Endpoint("http://llm/v1", "m", api_key="s3cret")
+    c.configure(Config(plain, plain, keyed, "./index", "localhost", 8765, 0.25, 0.5, None))
+    c._client("http://llm/v1"); c._client("http://x/v1")
+    assert [(k["base_url"], k["api_key"]) for k in calls] == [
+        ("http://llm/v1", "s3cret"), ("http://x/v1", "not-needed")]
+
+
+def test_configure_replaces_a_client_cached_with_a_stale_key(monkeypatch):
+    from vproc.config import Config, Endpoint
+
+    calls = []
+    monkeypatch.setattr(c, "OpenAI", lambda **kw: calls.append(kw) or object())
+    monkeypatch.setattr(c, "_api_keys", {})
+    c._clients.clear()
+    plain = Endpoint("http://x/v1", "m")
+    stale = c._client("http://llm/v1")
+    keyed = Endpoint("http://llm/v1", "m", api_key="s3cret")
+    c.configure(Config(plain, plain, keyed, "./index", "localhost", 8765, 0.25, 0.5, None))
+    assert c._client("http://llm/v1") is not stale
+    assert [k["api_key"] for k in calls] == ["not-needed", "s3cret"]
+
+
+def test_configure_ignores_direct_configs_without_keys(monkeypatch):
+    # Tests and embedders pass partial stand-in configs with injected fake clients.
+    monkeypatch.setattr(c, "_api_keys", {})
+    c.configure(SimpleNamespace(ocr=SimpleNamespace(base_url="u", model="m")))
+    assert c._api_keys == {}
+
 
 class _Seg:
     def __init__(self, s, e, t): self.start, self.end, self.text = s, e, t
@@ -178,15 +294,75 @@ def test_transcribe_audio_calls_asr_endpoint(tmp_path, monkeypatch):
         {"start": 1.0, "end": 2.0, "text": "world"},
     ]}
 
-def test_transcribe_audio_synthesizes_segment_from_text(tmp_path, monkeypatch):
+def test_transcribe_audio_synthesizes_segment_from_text(tmp_path, monkeypatch, caplog):
     resp = type("R", (), {"segments": None, "text": "  full transcript  "})()
     monkeypatch.setattr(c, "_client", lambda base_url: _FakeAudioClient({}, resp))
     wav = tmp_path / "a.wav"; _write_wav(wav, 2.0)
     out = c.transcribe_audio("http://x/v1", "whisper-1", str(wav))
     assert out == {"segments": [{"start": 0.0, "end": 2.0, "text": "full transcript"}]}
+    # One recording-long chunk with one speaker is a big quality loss: say so.
+    assert "no segment timestamps" in caplog.text
 
 def test_transcribe_audio_empty_when_no_segments_no_text(tmp_path, monkeypatch):
     resp = type("R", (), {"segments": None, "text": ""})()
     monkeypatch.setattr(c, "_client", lambda base_url: _FakeAudioClient({}, resp))
     wav = tmp_path / "a.wav"; _write_wav(wav, 1.0)
     assert c.transcribe_audio("http://x/v1", "whisper-1", str(wav)) == {"segments": []}
+
+
+class _Word:
+    def __init__(self, s, e, w): self.start, self.end, self.word = s, e, w
+
+
+def test_transcribe_audio_requests_words_and_files_them_under_their_segment(tmp_path, monkeypatch):
+    # OpenAI-style servers return one flat word list next to the segments.
+    cap = {}
+    resp = type("R", (), {
+        "segments": [_Seg(0.0, 1.0, " hello big"), _Seg(1.0, 2.0, " world")],
+        "words": [_Word(0.0, 0.4, "hello"), _Word(0.5, 1.0, "big"), _Word(1.1, 2.0, "world")]})()
+    monkeypatch.setattr(c, "_client", lambda base_url: _FakeAudioClient(cap, resp))
+    wav = tmp_path / "a.wav"; wav.write_bytes(b"RIFFxxxx")
+    out = c.transcribe_audio("http://x/v1", "whisper-1", str(wav))
+    assert cap["timestamp_granularities"] == ["word", "segment"]
+    assert out["segments"][0]["words"] == [{"start": 0.0, "end": 0.4, "word": "hello"},
+                                           {"start": 0.5, "end": 1.0, "word": "big"}]
+    assert out["segments"][1]["words"] == [{"start": 1.1, "end": 2.0, "word": "world"}]
+
+
+def test_transcribe_audio_accepts_words_nested_in_segments(tmp_path, monkeypatch):
+    # faster-whisper style servers nest each segment's words inside it.
+    seg = _Seg(0.0, 1.0, "hi there")
+    seg.words = [{"start": 0.0, "end": 0.5, "word": " hi"}, {"start": 0.5, "end": 1.0, "word": " there"}]
+    resp = type("R", (), {"segments": [seg], "words": None})()
+    monkeypatch.setattr(c, "_client", lambda base_url: _FakeAudioClient({}, resp))
+    wav = tmp_path / "a.wav"; wav.write_bytes(b"RIFFxxxx")
+    out = c.transcribe_audio("http://x/v1", "whisper-1", str(wav))
+    assert [w["word"] for w in out["segments"][0]["words"]] == [" hi", " there"]
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_transcribe_audio_retries_without_word_timestamps_on_a_strict_server(tmp_path, monkeypatch, status):
+    import httpx
+    from openai import BadRequestError, UnprocessableEntityError
+
+    error = BadRequestError if status == 400 else UnprocessableEntityError
+
+    attempts = []
+    resp = type("R", (), {"segments": [_Seg(0.0, 1.0, "hello")]})()
+
+    class Strict(_FakeAudioClient):
+        @property
+        def audio(self):
+            def create(**kw):
+                attempts.append(sorted(kw))
+                if "timestamp_granularities" in kw:
+                    raise error("unsupported", body=None, response=httpx.Response(
+                        status, request=httpx.Request("POST", "http://x/v1/audio/transcriptions")))
+                return resp
+            return SimpleNamespace(transcriptions=SimpleNamespace(create=create))
+
+    monkeypatch.setattr(c, "_client", lambda base_url: Strict({}, resp))
+    wav = tmp_path / "a.wav"; wav.write_bytes(b"RIFFxxxx")
+    out = c.transcribe_audio("http://x/v1", "whisper-1", str(wav))
+    assert out == {"segments": [{"start": 0.0, "end": 1.0, "text": "hello"}]}
+    assert len(attempts) == 2 and "timestamp_granularities" not in attempts[1]

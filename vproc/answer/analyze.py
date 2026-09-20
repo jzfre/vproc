@@ -29,6 +29,7 @@ def analyze_memory(store, cfg, memory_id: str, question: str,
                    project_id: str = "default") -> str:
     """Load the full transcript for `memory_id` and answer `question` about the whole
     thing. Returns the model's freeform answer string."""
+    client.configure(cfg)
     rows = store.memory_rows(memory_id, project_id)
     transcript = _transcript_text(rows)
     if not transcript:

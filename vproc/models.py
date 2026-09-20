@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -46,6 +48,10 @@ class Evidence(BaseModel):
     end_ts: float
     speaker: str
     text: str
+    # Retrieval always returns the k nearest segments, so expose how near (cosine; values are
+    # embedding-model specific) and whether the segment literally contains every query word.
+    similarity: float | None = None
+    keyword_match: bool = False
 
 
 class Citation(BaseModel):
@@ -67,3 +73,8 @@ class Answer(BaseModel):
     text: str
     claims: list[Claim]
     evidence: list[Evidence]
+    # Diagnostics for tuning sim_floor / hhem_threshold. Numbers and an enum only: the text of
+    # a rejected claim is unverified content and must never be returned.
+    abstain_reason: Literal["no_hits", "low_similarity", "no_answer", "unverified"] | None = None
+    top_sim: float | None = None
+    hhem_scores: list[float] | None = None

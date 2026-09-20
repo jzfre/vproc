@@ -2,6 +2,8 @@ from vproc.config import Config, Endpoint
 from vproc.models import Segment
 from vproc.store.lancedb_store import Store
 from vproc.ingest.embed_index import embed_and_store, embed_rows
+import types
+
 import pytest
 
 def _cfg():
@@ -73,3 +75,32 @@ def test_embed_and_store_rejects_dimension_change_without_adding_rows(tmp_path):
     with pytest.raises(ValueError, match="dimension"):
         embed_and_store(_cfg(), store, [_seg(2)], embed=lambda *args: [[1.0, 0.0, 0.0]])
     assert [row["id"] for row in store.all_rows()] == ["s1"]
+
+
+def test_preflight_checks_the_live_embedding_dimension_against_the_index(tmp_path):
+    from vproc.errors import IndexCompatibilityError
+    from vproc.ingest.embed_index import preflight
+    from vproc.store.lancedb_store import Store
+
+    store = Store(str(tmp_path / "db.lance"))
+    row = {"id": "a", "project_id": "p", "memory_id": "m", "speaker": "S", "start_ts": 0.0,
+           "end_ts": 1.0, "said_text": "x", "on_screen_text": "", "embed_text": "x",
+           "source_video": "/v.mp4", "frame_path": "", "vector": [1.0, 0.0]}
+    store.add([row], embedding_model="m")
+    cfg = types.SimpleNamespace(embed=types.SimpleNamespace(base_url="u", model="m"))
+    preflight(cfg, store, embed=lambda *a: [[0.5, 0.5]])  # same model, same dimension: fine
+    with pytest.raises(IndexCompatibilityError, match="dimension"):
+        # e.g. the server now serves different weights under the same model name
+        preflight(cfg, store, embed=lambda *a: [[0.1, 0.2, 0.3]])
+
+
+def test_preflight_propagates_an_unreachable_embedder(tmp_path):
+    from vproc.ingest.embed_index import preflight
+    from vproc.store.lancedb_store import Store
+
+    def down(*args):
+        raise ConnectionError("refused")
+
+    cfg = types.SimpleNamespace(embed=types.SimpleNamespace(base_url="u", model="m"))
+    with pytest.raises(ConnectionError):
+        preflight(cfg, Store(str(tmp_path / "db.lance")), embed=down)

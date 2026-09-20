@@ -26,6 +26,8 @@ def test_cmd_has_filters():
     assert "eq(n,0)" in joined
     assert "metadata=print:file=/out/frames.log" in joined
     assert "-nostdin" in cmd
+    # Progress stats would flood a backgrounded/logged ingest; real errors still print.
+    assert cmd[cmd.index("-loglevel") + 1] == "error"
 
 def test_parse_frames_log_pairs_paths_to_times():
     log = "frame:0 pts_time:0.000000\nframe:1 pts_time:12.500000\n"

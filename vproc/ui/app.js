@@ -28,7 +28,10 @@ async function fetchJson(url, opts) {
   try {
     res = await fetch(url, opts);
   } catch (e) {
-    throw new Error("network error — is the server running?", {cause: e});
+    if (e && e.name === "AbortError") throw e;  // the user stopped waiting: not a network fault
+    const err = new Error("network error — is the server running?", {cause: e});
+    err.network = true;
+    throw err;
   }
   if (!res.ok) {
     let detail = "";
@@ -284,24 +287,41 @@ $("video").addEventListener("error", async () => {
 // ---------- ask / search panel ----------
 
 // No fetch timeout here on purpose: `ask` runs a thinking/grounding model and
-// can legitimately take well over a minute. The spinner + disabled controls
-// are the only "is this still working" signal, not a request deadline.
+// can legitimately take well over a minute. An elapsed counter shows it is alive,
+// and "Stop waiting" only ends the wait: the server cannot cancel a generation,
+// so the messages never claim it was cancelled.
+let pendingQuery = null;
+
 async function runQuery() {
   if ($("qa-go").disabled) return;
   const mode = $("qa-mode").value;
   const q = $("qa-input").value.trim();
   if (!q) return;
+  const controller = new AbortController();
+  pendingQuery = controller;
   $("qa-spinner").hidden = false;
   $("qa-go").disabled = true;
   $("qa-input").disabled = true;
   $("qa-mode").disabled = true;
   $("qa-results").innerHTML = "";
+  let ticker = null;
+  const started = Date.now();
+  if (mode === "ask") {
+    // Announced once (role=status). The seconds tick in a separate aria-hidden element: a live
+    // region that changes every second would be read out each time and delay the result.
+    $("qa-status").textContent = "Answering… (grounded answers can take a minute or more)";
+    const tick = () => { $("qa-elapsed").textContent = `${Math.round((Date.now() - started) / 1000)} s`; };
+    tick();
+    ticker = setInterval(tick, 1000);
+    $("qa-stop").hidden = false;
+  }
   try {
     if (mode === "ask") {
       const a = await fetchJson("/ask", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({question: q}),
+        signal: controller.signal,
       });
       renderAskResult(a);
     } else {
@@ -309,12 +329,25 @@ async function runQuery() {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({query: q}),
+        signal: controller.signal,
       });
-      renderSearchResults(hits);
+      renderSearchResults(hits, q);
     }
   } catch (e) {
-    $("qa-results").innerHTML = `<p class="qa-error">${escapeHtml(e.message)}</p>`;
+    let message = e.message;
+    if (e.name === "AbortError") {
+      message = "Stopped waiting. The server may still finish this answer; a new question will queue behind it.";
+    } else if (mode === "ask" && e.network && Date.now() - started > 2000) {
+      // Only after a real wait: an immediate failure means the server was never reached.
+      message = "Connection lost while waiting; the server may still be finishing this answer.";
+    }
+    $("qa-results").innerHTML = `<p class="qa-error">${escapeHtml(message)}</p>`;
   } finally {
+    if (ticker !== null) clearInterval(ticker);
+    pendingQuery = null;
+    $("qa-status").textContent = "";
+    $("qa-elapsed").textContent = "";
+    $("qa-stop").hidden = true;
     $("qa-spinner").hidden = true;
     $("qa-go").disabled = false;
     $("qa-input").disabled = false;
@@ -322,10 +355,20 @@ async function runQuery() {
   }
 }
 
+// Why an answer abstained, in plain words. Never shows a rejected claim: that text is unverified.
+const ABSTAIN_HINTS = {
+  no_hits: "Nothing in the library matched this question.",
+  low_similarity: "Nothing in the library was similar enough to this question.",
+  no_answer: "The most relevant passages did not contain an answer.",
+  unverified: "A draft answer could not be verified against the passages it cited, so it was withheld.",
+};
+
 function renderAskResult(a) {
   const results = $("qa-results");
   if (a.abstained || !a.answered) {
-    results.innerHTML = `<p class="qa-abstain">${escapeHtml(a.text || "Not discussed in these meetings.")}</p>`;
+    const hint = ABSTAIN_HINTS[a.abstain_reason];
+    results.innerHTML = `<p class="qa-abstain">${escapeHtml(a.text || "Not discussed in these meetings.")}</p>`
+      + (hint ? `<p class="qa-note">${escapeHtml(hint)}</p>` : "");
     return;
   }
   const html = a.claims.map((claim) => {
@@ -341,18 +384,27 @@ function renderAskResult(a) {
   results.innerHTML = html || `<p class="qa-abstain">${escapeHtml(a.text || "")}</p>`;
 }
 
-function renderSearchResults(hits) {
+function renderSearchResults(hits, query = "") {
   const results = $("qa-results");
   if (!Array.isArray(hits) || hits.length === 0) {
     results.innerHTML = `<p class="qa-abstain">No matching segments found.</p>`;
     return;
   }
-  results.innerHTML = hits.map((e) => `
+  // Search always returns the nearest segments, even for a word that appears nowhere. Say so
+  // for short literal-looking queries, claiming only what is known: these are the top results,
+  // not the whole library. Similarity is a plain number: useful values differ per embedder.
+  const words = query.split(/\s+/).filter(Boolean).length;
+  const literalMiss = words > 0 && words <= 3 && !hits.some((e) => e.keyword_match);
+  const note = literalMiss
+    ? `<p class="qa-note">None of these results contains every word of the query — showing the nearest matches.</p>` : "";
+  results.innerHTML = note + hits.map((e) => `
     <div class="hit" role="button" tabindex="0" data-memory="${escapeHtml(e.memory_title)}" data-start="${e.start_ts}">
       <div class="hit-head">
         <span class="hit-speaker" style="--c:${colorFor(e.speaker)}">${escapeHtml(e.speaker)}</span>
         <span class="hit-time">${fmt(e.start_ts)}–${fmt(e.end_ts)}</span>
         <span class="hit-memory">${escapeHtml(e.memory_title)}</span>
+        ${e.keyword_match ? `<span class="badge badge-exact" title="Contains every word of the query">exact</span>` : ""}
+        ${typeof e.similarity === "number" ? `<span class="hit-sim" title="Cosine similarity to the query">${e.similarity.toFixed(2)}</span>` : ""}
       </div>
       <p class="hit-text">${escapeHtml(e.text)}</p>
     </div>`).join("");
@@ -372,6 +424,7 @@ function jumpFromResults(target) {
 }
 
 $("qa-go").addEventListener("click", runQuery);
+$("qa-stop").addEventListener("click", () => { if (pendingQuery) pendingQuery.abort(); });
 $("qa-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") runQuery();
 });

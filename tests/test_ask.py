@@ -29,6 +29,7 @@ def test_hallucination_guard_abstains_on_empty_retrieval():
                      _retrieve=fake_retrieve, _generate=lambda *a: 1 / 0)  # must not be called
     assert ans.answered is False and ans.abstained is True
     assert ans.text == ABSTAIN
+    assert ans.abstain_reason == "no_hits"
 
 def test_abstains_below_similarity_floor():
     def fake_retrieve(*a, **k):
@@ -36,6 +37,7 @@ def test_abstains_below_similarity_floor():
     ans = ask_memory(None, _cfg(), "q", scorer=lambda p, h: 0.9,
                      _retrieve=fake_retrieve, _generate=lambda *a: 1 / 0)
     assert ans.text == ABSTAIN
+    assert ans.abstain_reason == "low_similarity" and ans.top_sim == 0.10
 
 def test_abstains_when_hhem_rejects_all():
     def fake_retrieve(*a, **k):
@@ -45,6 +47,9 @@ def test_abstains_when_hhem_rejects_all():
     ans = ask_memory(None, _cfg(), "q", scorer=lambda p, h: 0.1,  # HHEM rejects
                      _retrieve=fake_retrieve, _generate=fake_generate)
     assert ans.text == ABSTAIN
+    # The cause and the gate's numbers are observable; the rejected claim's text never is.
+    assert ans.abstain_reason == "unverified" and ans.hhem_scores == [0.1]
+    assert "petrol" not in ans.model_dump_json()
 
 def test_claim_evidence_ids_filtered_to_returned_evidence():
     def fake_retrieve(store, cfg, q, k=8, where=None):
@@ -83,3 +88,36 @@ def test_answer_can_ground_speaker_identity_from_segment_metadata():
     assert ans.answered is True
     assert ans.claims[0].text == "Tim V said cars are electric now"
     assert ans.claims[0].citations[0].speaker == "Tim V"
+
+
+def test_abstains_with_reason_when_model_declines():
+    ans = ask_memory(None, _cfg(), "q", scorer=lambda p, h: 0.9,
+                     _retrieve=lambda *a, **k: ([_hit("s1", "cars")], 0.9),
+                     _generate=lambda *a: {"answered": False, "claims": []})
+    assert ans.text == ABSTAIN and ans.abstain_reason == "no_answer" and ans.top_sim == 0.9
+
+
+def test_answer_reports_similarity_and_gate_scores():
+    ans = ask_memory(None, _cfg(), "q", scorer=lambda p, h: 0.8,
+                     _retrieve=lambda *a, **k: ([_hit("s1", "cars are electric")], 0.7),
+                     _generate=lambda *a: {"answered": True, "claims": [
+                         {"text": "cars are electric", "evidence_ids": ["E1"]}]})
+    assert ans.answered and ans.abstain_reason is None
+    assert ans.top_sim == 0.7 and ans.hhem_scores == [0.8]
+
+
+def test_search_evidence_carries_similarity_and_keyword_match():
+    hit = {**_hit("s1", "cars"), "_similarity": 0.61, "_keyword_match": True}
+    ev = search_memory(None, _cfg(), "cars", _retrieve=lambda *a, **k: ([hit, _hit("s2", "x")], 0.61))
+    assert (ev[0].similarity, ev[0].keyword_match) == (0.61, True)
+    assert (ev[1].similarity, ev[1].keyword_match) == (None, False)
+
+
+def test_top_sim_reports_the_real_best_similarity_not_the_keyword_lifted_gate_value():
+    # The gate compares a value that a literal keyword match lifts to the floor; the diagnostic
+    # is for tuning the floor, so it reports the best cosine actually measured.
+    hit = {**_hit("s1", "error ERR-4127"), "_similarity": 0.12, "_keyword_match": True}
+    ans = ask_memory(None, _cfg(), "ERR-4127", scorer=lambda p, h: 0.9,
+                     _retrieve=lambda *a, **k: ([hit], 0.25),  # lifted to the floor
+                     _generate=lambda *a: {"answered": False, "claims": []})
+    assert ans.abstain_reason == "no_answer" and ans.top_sim == 0.12
