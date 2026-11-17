@@ -80,3 +80,24 @@ private recordings, transcripts, answers, or credentials as evaluation fixtures.
   startup/UI/MCP setup and synthetic FFmpeg ingestion, restart persistence,
   media playback endpoints, and search against temporary loopback model responses.
 - Hosted CI is added but its first GitHub run has not been observed locally.
+
+## Follow-up: zero embeddings
+
+A real LanceDB reproduction showed that an all-zero embedding was accepted on
+write but omitted from cosine search; a zero query also returned no results.
+Cosine similarity is undefined for zero vectors, so this must be an error rather
+than a successful ingest or an apparent lack of meeting evidence. The embedding
+client now rejects zero backend output, and the store rejects zero writes and
+queries. Five regression cases failed before the fix and pass afterward,
+including checks that rejected additions and replacements preserve both rows
+and the existing table version. No existing index is rewritten by this fix;
+recordings previously ingested with zero embeddings need re-ingestion with a
+working backend.
+
+Final follow-up verification: **648 Python tests passed**, no skips; application
+lint and whitespace checks passed. Source archive and wheel rebuilt successfully;
+the rebuilt installed wheel again passed the full synthetic-media smoke test.
+A separate code review of the preceding timestamp/retrieval commit found no
+regressions and passed its 177 focused tests. Publishing remains incomplete:
+the remote is readable anonymously, but this host has no authenticated GitHub
+CLI session or SSH key, and HTTPS push fails for missing credentials.

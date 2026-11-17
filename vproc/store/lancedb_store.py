@@ -27,6 +27,10 @@ def _vector_dimension(vectors) -> int:
         if any(isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value)
                for value in vector):
             raise ValueError("Each embedding vector must contain only finite numbers")
+        # Cosine similarity is undefined for zero vectors. Lance silently omits
+        # them from search, so accepting one would hide otherwise valid evidence.
+        if not any(vector):
+            raise ValueError("Each embedding vector must be nonzero for cosine search")
         if dimension is not None and len(vector) != dimension:
             raise ValueError("Embedding vector dimensions must match")
         dimension = len(vector)
@@ -235,6 +239,8 @@ class Store:
             self._validate_embedding_model(table, embedding_model, _vector_dimension([vector]))
         if table is None:
             return []
+        if embedding_model is None:
+            _vector_dimension([vector])
         q = table.search(vector).metric("cosine").limit(k)
         if where:
             q = q.where(where, prefilter=True)

@@ -60,6 +60,8 @@ def embed_texts(base_url: str, model: str, texts: list[str]) -> list[list[float]
             if (not isinstance(vector, list) or not vector
                     or any(type(v) not in (int, float) or not math.isfinite(v) for v in vector)):
                 raise ValueError("invalid embedding response vector")
+            if not any(vector):
+                raise ValueError("embedding response vector must be nonzero for cosine search")
             if dimensions is None:
                 dimensions = len(vector)
             if len(vector) != dimensions:

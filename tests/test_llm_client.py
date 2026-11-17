@@ -380,3 +380,11 @@ def test_remote_asr_invalid_times_reach_shared_validation(tmp_path, monkeypatch,
     wav.write_bytes(b"placeholder")
     with pytest.raises(IngestError, match="timestamps"):
         transcribe(str(wav), endpoint=Endpoint("http://asr/v1", "asr"))
+
+
+def test_embed_texts_rejects_zero_vector_from_backend(monkeypatch):
+    response = SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[0.0, -0.0])])
+    fake = SimpleNamespace(embeddings=SimpleNamespace(create=lambda **kw: response))
+    monkeypatch.setattr(c, "_client", lambda _: fake)
+    with pytest.raises(ValueError, match="embedding.*vector"):
+        c.embed_texts("u", "m", ["a real transcript chunk"])

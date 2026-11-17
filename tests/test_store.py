@@ -394,3 +394,26 @@ def test_fts_search_failure_warns_without_logging_query_or_transcript(tmp_path, 
     assert "FTS" in caplog.text
     assert "private query text" not in caplog.text
     assert "private transcript text" not in caplog.text
+
+
+@pytest.mark.parametrize("operation", ["add", "replace"])
+def test_zero_embedding_cannot_replace_or_append_to_valid_memory(tmp_path, operation):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
+    before = store._table().version
+    bad = _row("zero", "p", [0.0, -0.0])
+    with pytest.raises(ValueError, match="nonzero"):
+        if operation == "add":
+            store.add([bad], embedding_model="model-a")
+        else:
+            store.replace_memory("m", "p", [bad], embedding_model="model-a")
+    assert store._table().version == before
+    assert [r["id"] for r in store.memory_rows("m", "p")] == ["old"]
+
+
+@pytest.mark.parametrize("embedding_model", [None, "model-a"])
+def test_zero_query_embedding_is_an_error_not_empty_results(tmp_path, embedding_model):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
+    with pytest.raises(ValueError, match="nonzero"):
+        store.vector_search([0.0, -0.0], 1, embedding_model=embedding_model)
