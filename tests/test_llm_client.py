@@ -366,3 +366,17 @@ def test_transcribe_audio_retries_without_word_timestamps_on_a_strict_server(tmp
     out = c.transcribe_audio("http://x/v1", "whisper-1", str(wav))
     assert out == {"segments": [{"start": 0.0, "end": 1.0, "text": "hello"}]}
     assert len(attempts) == 2 and "timestamp_granularities" not in attempts[1]
+
+
+@pytest.mark.parametrize("start", [True, None, float("nan"), -1])
+def test_remote_asr_invalid_times_reach_shared_validation(tmp_path, monkeypatch, start):
+    from vproc.config import Endpoint
+    from vproc.errors import IngestError
+    from vproc.ingest.transcribe import transcribe
+
+    response = SimpleNamespace(segments=[_Seg(start, 1, "hello")])
+    monkeypatch.setattr(c, "_client", lambda _: _FakeAudioClient({}, response))
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"placeholder")
+    with pytest.raises(IngestError, match="timestamps"):
+        transcribe(str(wav), endpoint=Endpoint("http://asr/v1", "asr"))

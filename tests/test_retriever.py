@@ -150,3 +150,33 @@ def test_keyword_match_ignores_the_structural_markers_of_indexed_text(tmp_path):
     assert hits[0]["_keyword_match"] is True and top_sim == _cfg().sim_floor
     hits, _ = retrieve(store, _cfg(), "SPEAKER_01 budget", k=2, embed=orthogonal)
     assert hits[0]["_keyword_match"] is True              # the speaker label is real content
+
+
+def test_relevance_gate_uses_only_evidence_retained_after_fusion():
+    from types import SimpleNamespace
+
+    # A partial match wins both rankings; the qualifying hit is dropped at k=2.
+    common = _row("common", [1, 0], "release budget")
+    weak = _row("weak", [1, 0], "budget")
+    qualifying = _row("qualifying", [1, 0], "release date")
+    vhits = [{**common, "_distance": 0.9}, {**weak, "_distance": 0.95}]
+    fhits = [common, qualifying]
+    store = SimpleNamespace(
+        validate_embedding_model=lambda *a: None,
+        vector_search=lambda *a, **kw: vhits,
+        fts_search=lambda *a, **kw: fhits,
+    )
+    hits, score = retrieve(store, _cfg(), "release date",
+                           k=2,
+                           embed=lambda *a: [[1, 0]])
+    assert "qualifying" not in {hit["id"] for hit in hits}
+    assert score < _cfg().sim_floor
+
+
+def test_retained_keyword_match_qualifies_when_fts_is_unavailable(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("code", [0., 1.], "Deployment failed with ERR-4127")], embedding_model="m")
+    monkeypatch.setattr(store, "fts_search", lambda *a: [])
+    hits, score = retrieve(store, _cfg(), "ERR-4127", embed=lambda *a: [[1., 0.]])
+    assert hits[0]["_keyword_match"] is True
+    assert score == _cfg().sim_floor

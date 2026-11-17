@@ -795,3 +795,28 @@ def test_reingest_says_when_it_replaces_manual_speaker_names(tmp_path, monkeypat
     P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
     err = capsys.readouterr().err
     assert "previous speaker names" in err and "vproc speakers" in err
+
+
+def test_invalid_asr_timestamps_preserve_previous_memory_and_frames(tmp_path, monkeypatch):
+    from vproc.errors import IngestError
+    from vproc.ingest.transcribe import segments_from_whisper
+
+    cfg, store = _cfg(tmp_path), FakeStore()
+    _patch(monkeypatch, tmp_path)
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    old_rows = list(store.rows)
+    old_frames = {r["frame_path"]: pathlib.Path(r["frame_path"]).read_bytes()
+                  for r in old_rows if r["frame_path"]}
+    store.calls.clear()
+    _patch(monkeypatch, tmp_path)
+
+    def invalid_asr(*args):
+        return segments_from_whisper({"segments": [
+            {"start": 0, "end": float("nan"), "text": "bad replacement"},
+        ]})
+
+    monkeypatch.setattr(P.T, "transcribe", invalid_asr)
+    with pytest.raises(IngestError, match="timestamps"):
+        P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    assert store.calls == [] and store.rows == old_rows
+    assert all(pathlib.Path(path).read_bytes() == data for path, data in old_frames.items())

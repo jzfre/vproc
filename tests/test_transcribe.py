@@ -1,3 +1,5 @@
+import pytest
+
 from vproc.ingest.transcribe import (
     segments_from_whisper, extract_audio_cmd, transcribe, TranscriptSegment,
 )
@@ -115,3 +117,46 @@ def test_local_transcription_survives_a_word_alignment_failure(capsys):
     assert transcribe("a.wav", transcriber=flaky) == [TranscriptSegment(0.0, 1.0, "hi")]
     assert calls == [True, False]
     assert "word timestamps" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("start,end", [
+    (float("nan"), 2), (0, float("inf")), (-1, 2), (2, 1), (True, 2), (None, 2),
+])
+def test_invalid_segment_timestamps_fail_before_indexing(start, end):
+    from vproc.errors import IngestError
+
+    with pytest.raises(IngestError, match="timestamps"):
+        segments_from_whisper({"segments": [{"start": start, "end": end, "text": "private text"}]})
+
+
+@pytest.mark.parametrize("words", [
+    [{"start": float("nan"), "end": 1, "word": "Hello."}],
+    [{"start": 0, "end": float("inf"), "word": "Hello."}],
+    [{"start": -1, "end": 1, "word": "Hello."}],
+    [{"start": 1, "end": 0, "word": "Hello."}],
+    [{"start": 0, "end": 3, "word": "Hello."}],
+    [{"start": True, "end": 1, "word": "Hello."}],
+])
+def test_invalid_optional_word_times_preserve_segment(words):
+    seg = segments_from_whisper({"segments": [
+        {"start": 0, "end": 2, "text": "Hello.", "words": words},
+    ]})[0]
+    assert seg == TranscriptSegment(0, 2, "Hello.")
+
+
+def test_out_of_order_words_fall_back_to_segment_attribution():
+    seg = segments_from_whisper({"segments": [
+        {"start": 0, "end": 3, "text": "Hello there.", "words": [
+            {"start": 2, "end": 3, "word": "Hello"},
+            {"start": 0, "end": 1, "word": "there."},
+        ]},
+    ]})[0]
+    assert seg.words is None
+
+
+def test_transcript_segments_are_sorted_for_chronological_chunking():
+    segments = segments_from_whisper({"segments": [
+        {"start": 3, "end": 4, "text": "second"},
+        {"start": 0, "end": 1, "text": "first"},
+    ]})
+    assert [seg.text for seg in segments] == ["first", "second"]

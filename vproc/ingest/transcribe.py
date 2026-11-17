@@ -1,7 +1,9 @@
+import math
 import re
 import sys
 from dataclasses import dataclass
 
+from vproc.errors import IngestError
 from vproc.llm import client
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
@@ -45,15 +47,28 @@ def squash(text: str) -> str:
     return re.sub(r"[\W_]+", "", text.lower())
 
 
-def _words(raw, text: str) -> list[tuple[float, float, str]] | None:
+def _timestamp(value) -> float:
+    if isinstance(value, bool):
+        raise ValueError("Boolean timestamp")
+    timestamp = float(value)
+    if not math.isfinite(timestamp) or timestamp < 0:
+        raise ValueError("Invalid timestamp")
+    return timestamp
+
+
+def _words(raw, text: str, start: float, end: float) -> list[tuple[float, float, str]] | None:
     """Word timestamps, only if they spell the segment: misaligned words would hand text to
     the wrong speaker, and whole-segment attribution is the safer fallback."""
     try:
-        words = [(float(w["start"]), float(w["end"]), str(w["word"]).strip()) for w in raw or []]
-    except (KeyError, TypeError, ValueError):
+        words = [(_timestamp(w["start"]), _timestamp(w["end"]), str(w["word"]).strip()) for w in raw or []]
+    except (KeyError, TypeError, ValueError, OverflowError):
         return None
     words = [w for w in words if w[2]]
     if not words or squash("".join(w[2] for w in words)) != squash(text):
+        return None
+    if any(not start <= a <= b <= end for a, b, _ in words):
+        return None
+    if any(a[0] > b[0] or a[1] > b[1] for a, b in zip(words, words[1:])):
         return None
     return words
 
@@ -64,9 +79,15 @@ def segments_from_whisper(result: dict) -> list[TranscriptSegment]:
         raw_text = (s.get("text") or "").strip()
         text = _collapse_repetition(raw_text)
         if text:
-            out.append(TranscriptSegment(start=float(s["start"]), end=float(s["end"]), text=text,
-                                         words=_words(s.get("words"), raw_text)))
-    return out
+            try:
+                start, end = _timestamp(s["start"]), _timestamp(s["end"])
+                if end < start:
+                    raise ValueError("Reversed interval")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                raise IngestError("ASR returned invalid segment timestamps; check the transcription backend.") from None
+            out.append(TranscriptSegment(start=start, end=end, text=text,
+                                         words=_words(s.get("words"), raw_text, start, end)))
+    return sorted(out, key=lambda seg: seg.start)
 
 
 def _transcribe_local(audio_path: str, model: str, transcriber=None) -> dict:

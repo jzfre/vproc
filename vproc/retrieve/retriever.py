@@ -28,7 +28,6 @@ def retrieve(store, cfg, query: str, k: int = 8, where: str | None = None,
     fhits = store.fts_search(query, k, where)
     if not vhits and not fhits:
         return [], 0.0
-    top_sim = (1.0 - float(vhits[0]["_distance"])) if vhits else 0.0
     # LanceDB 0.33 FTS defaults to operator=OR with no stop-word removal, so almost any
     # question shares a token with some chunk. Only lift the floor on a true keyword match
     # (one hit's text contains ALL query tokens) so an exact match like 'ERR-4127' survives
@@ -39,8 +38,6 @@ def retrieve(store, cfg, query: str, k: int = 8, where: str | None = None,
         content = _SCAFFOLD.sub(" ", hit.get("embed_text", ""))
         return bool(qtokens) and qtokens <= set(re.findall(r"\w+", content.lower()))
 
-    if any(keyword_match(h) for h in fhits):
-        top_sim = max(top_sim, cfg.sim_floor)
     similarity = {h["id"]: 1.0 - float(h["_distance"]) for h in vhits}
     by_id = {h["id"]: h for h in (vhits + fhits)}
     for sid, hit in by_id.items():
@@ -53,4 +50,9 @@ def retrieve(store, cfg, query: str, k: int = 8, where: str | None = None,
         key=lambda kv: kv[1], reverse=True,
     )
     merged = [by_id[sid] for sid, _ in ranked if sid in by_id][:k]
+    # Only evidence actually passed to generation may open the relevance gate.
+    # Fusion can discard a literal FTS match in favor of hits shared by both legs.
+    top_sim = max((h["_similarity"] for h in merged if h["_similarity"] is not None), default=0.0)
+    if any(h["_keyword_match"] for h in merged):
+        top_sim = max(top_sim, cfg.sim_floor)
     return merged, top_sim

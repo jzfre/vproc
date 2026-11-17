@@ -1,0 +1,27 @@
+name: Checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install uv
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: uv sync --locked
+      - run: uv run --no-sync pytest -q
+      - run: node --test tests/test_ui.cjs
+      - run: uv run --no-sync ruff check vproc
+      - run: uv build
+      - name: Verify installed wheel with synthetic media
+        run: uv run --no-project --python 3.12 --refresh-package vproc --with ./dist/vproc-0.1.0-py3-none-any.whl python scripts/smoke_release.py

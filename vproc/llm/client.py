@@ -134,7 +134,8 @@ def _wav_duration(path: str) -> float:
 
 def _word(w) -> dict:
     get = w.get if isinstance(w, dict) else lambda key: getattr(w, key, None)
-    return {"start": float(get("start")), "end": float(get("end")), "word": str(get("word") or "")}
+    # Preserve raw timestamps for the shared ASR validator (including booleans).
+    return {"start": get("start"), "end": get("end"), "word": str(get("word") or "")}
 
 
 def _attach_words(out: list[dict], segs, flat) -> None:
@@ -181,7 +182,7 @@ def transcribe_audio(base_url: str, model: str, audio_path: str) -> dict:
         resp = create()  # strict server without word timestamps: whole-segment attribution
     segs = getattr(resp, "segments", None) or []
     if segs:
-        out = [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in segs]
+        out = [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
         _attach_words(out, segs, getattr(resp, "words", None))
         return {"segments": out}
     # Backends that downgrade verbose_json return only `text`; synthesize one segment
