@@ -160,3 +160,15 @@ def test_failed_speaker_map_save_preserves_previous_file(tmp_path):
         save_speaker_map(str(tmp_path), {"mapping": {"not JSON serializable"}})
     assert load_speaker_map(str(tmp_path)) == previous
     assert sorted(p.name for p in tmp_path.iterdir()) == ["speakers.json"]
+
+
+def test_probe_filenames_do_not_use_untrusted_speaker_labels(monkeypatch):
+    from pathlib import Path
+    paths = []
+    monkeypatch.setattr(N, "_frame_at", lambda video, t, out: paths.append(Path(out)))
+    turns = [SpeakerTurn(0, 1, "../../outside"), SpeakerTurn(2, 3, "/absolute")]
+    votes = N.sample_name_votes("v", turns, cfg=None, probe=lambda path: "{}")
+    assert len(votes) == 2
+    assert {p.name for p in paths} == {"probe-1.png", "probe-2.png"}
+    assert len({p.parent for p in paths}) == 1
+    assert paths[0].parent.name.startswith("vproc-name-")

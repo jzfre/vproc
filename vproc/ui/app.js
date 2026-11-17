@@ -306,6 +306,7 @@ async function runQuery() {
   $("qa-results").innerHTML = "";
   let ticker = null;
   const started = Date.now();
+  $("qa-stop").hidden = false;
   if (mode === "ask") {
     // Announced once (role=status). The seconds tick in a separate aria-hidden element: a live
     // region that changes every second would be read out each time and delay the result.
@@ -313,14 +314,17 @@ async function runQuery() {
     const tick = () => { $("qa-elapsed").textContent = `${Math.round((Date.now() - started) / 1000)} s`; };
     tick();
     ticker = setInterval(tick, 1000);
-    $("qa-stop").hidden = false;
+  } else {
+    $("qa-status").textContent = "Searching…";
   }
   try {
+    // The player/catalogue expose the default project only. Restrict queries to
+    // it too, or a same-titled memory in another project could seek the wrong video.
     if (mode === "ask") {
       const a = await fetchJson("/ask", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({question: q}),
+        body: JSON.stringify({question: q, project: "default"}),
         signal: controller.signal,
       });
       renderAskResult(a);
@@ -328,7 +332,7 @@ async function runQuery() {
       const hits = await fetchJson("/search", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({query: q}),
+        body: JSON.stringify({query: q, project: "default"}),
         signal: controller.signal,
       });
       renderSearchResults(hits, q);
@@ -336,7 +340,7 @@ async function runQuery() {
   } catch (e) {
     let message = e.message;
     if (e.name === "AbortError") {
-      message = "Stopped waiting. The server may still finish this answer; a new question will queue behind it.";
+      message = "Stopped waiting. The server may still finish this request.";
     } else if (mode === "ask" && e.network && Date.now() - started > 2000) {
       // Only after a real wait: an immediate failure means the server was never reached.
       message = "Connection lost while waiting; the server may still be finishing this answer.";

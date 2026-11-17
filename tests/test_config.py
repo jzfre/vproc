@@ -440,3 +440,25 @@ def test_load_dotenv_reports_which_file_it_loaded(tmp_path):
         assert load_dotenv(str(tmp_path / "missing.env")) is None
     finally:
         os.environ.pop("UNUSED_VPROC_TEST_KEY", None)
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_concurrent_query_limit_must_be_positive_integer(clean_config_env, limit):
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="max_concurrent_queries"):
+        replace(load_config(), max_concurrent_queries=limit)
+
+
+def test_concurrent_query_limit_loads_from_environment(clean_config_env, monkeypatch):
+    monkeypatch.setenv("VPROC_MAX_CONCURRENT_QUERIES", "2")
+    assert load_config().max_concurrent_queries == 2
+
+
+def test_config_repr_hides_hub_token_and_url_credentials(clean_config_env, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf_private_value")
+    monkeypatch.setenv("VPROC_GROUNDING_BASE_URL", "https://user:url_secret@example.com/v1")
+    cfg = load_config()
+    assert "hf_private_value" not in repr(cfg)
+    assert "url_secret" not in repr(cfg)
+    assert "url_secret" not in repr(cfg.grounding)

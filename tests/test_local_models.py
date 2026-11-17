@@ -104,3 +104,68 @@ def test_health_reports_loaded_models_and_there_is_no_chat_route(server):
     # vproc talks to the LLM directly (VPROC_GROUNDING_API_KEY_FILE) and disables OCR with an
     # empty VPROC_OCR_BASE_URL: this server must not grow a key-carrying proxy or an OCR stub.
     assert client.post("/v1/chat/completions", json={}).status_code == 404
+
+
+@pytest.mark.parametrize("kind", ["asr", "embed"])
+def test_busy_model_rejects_work_without_queueing_or_blocking_health(server, monkeypatch, kind):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    entered, release = Event(), Event()
+    class BlockingWhisper(_Whisper):
+        def transcribe(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(3), "test release timed out"
+            return super().transcribe(*args, **kwargs)
+    class BlockingEmbedder(_Embedder):
+        def encode(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(3), "test release timed out"
+            return super().encode(*args, **kwargs)
+    monkeypatch.setattr(server, "_whisper", lambda: BlockingWhisper())
+    monkeypatch.setattr(server, "_embedder", lambda: BlockingEmbedder())
+    client = TestClient(server.app)
+    request = (lambda: _transcribe(client, server)) if kind == "asr" else (
+        lambda: client.post("/v1/embeddings", json={"model": server.EMBED_MODEL, "input": "hello"}))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(request)
+        try:
+            assert entered.wait(2)
+            second = pool.submit(request)
+            busy = second.result(timeout=1)
+            assert busy.status_code == 503 and busy.headers["retry-after"] == "1"
+            assert client.get("/health").status_code == 200
+        finally:
+            release.set()
+        assert first.result(timeout=2).status_code == 200
+    assert request().status_code == 200  # admission released after the first request
+
+
+@pytest.mark.parametrize("failure", ["decode", "iteration"])
+def test_transcription_failure_cleans_tempfile_and_does_not_leak_details(server, monkeypatch, failure, capsys):
+    files = []
+    class BrokenWhisper(_Whisper):
+        def transcribe(self, path, **kwargs):
+            files.append(Path(path))
+            assert Path(path).read_bytes() == b"RIFF"
+            if failure == "decode":
+                raise RuntimeError("private token and transcript")
+            def broken_segments():
+                raise RuntimeError("private token and transcript")
+                yield
+            _, info = super().transcribe(path, **kwargs)
+            return broken_segments(), info
+    monkeypatch.setattr(server, "_whisper", lambda: BrokenWhisper())
+    client = TestClient(server.app, raise_server_exceptions=False)
+    response = _transcribe(client, server)
+    assert response.status_code == 503
+    assert files and all(not p.exists() for p in files)
+    assert "private token" not in response.text + capsys.readouterr().err
+    monkeypatch.setattr(server, "_whisper", lambda: _Whisper())
+    assert _transcribe(client, server).status_code == 200
+
+
+def test_oversized_embedding_batch_rejected_before_loading_model(server, monkeypatch):
+    monkeypatch.setattr(server, "_embedder", lambda: pytest.fail("oversized request loaded a model"))
+    response = TestClient(server.app).post("/v1/embeddings", json={
+        "model": server.EMBED_MODEL, "input": ["hello"] * 33})
+    assert response.status_code == 400

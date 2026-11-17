@@ -96,7 +96,11 @@ def ingest_video(video_path: str, cfg=None, store=None, project_id: str = "defau
             raise IngestError(f"the embedding backend check failed ({type(e).__name__}). Check "
                               "VPROC_EMBED_BASE_URL, VPROC_EMBED_MODEL and its API key, or run "
                               "'vproc doctor --online'.") from None
-        return _ingest_locked(video_path, cfg, store, project_id, title, mem_dir)
+        try:
+            return _ingest_locked(video_path, cfg, store, project_id, title, mem_dir)
+        except OpenAIError as exc:
+            raise IngestError(f"Model backend failed during ingest ({type(exc).__name__}). "
+                              "Check model services and configuration, or run 'vproc doctor --online'.") from None
 
 
 def _ingest_locked(video_path, cfg, store, project_id, title, mem_dir) -> int:
@@ -126,6 +130,8 @@ def _ingest_locked(video_path, cfg, store, project_id, title, mem_dir) -> int:
         if transcript and cfg.diarize_model:
             try:
                 turns = D.diarize(wav_path, cfg)
+                if not turns:
+                    raise ValueError("Diarization returned no speaker turns for a nonempty transcript")
                 transcript = D.assign_speakers(transcript, turns)
                 clock = _progress(
                     "speakers", f"{len({t.speaker for t in turns})} speakers in {len(turns)} turns", clock)
@@ -146,11 +152,11 @@ def _ingest_locked(video_path, cfg, store, project_id, title, mem_dir) -> int:
                             print(f"unresolved speaker: {spk} (review with 'vproc speakers {title}')")
                     except Exception as e:
                         # Naming must never undo diarization labels or block the ingest.
-                        print(f"warning: speaker naming failed: {e}", file=sys.stderr)
+                        print(f"warning: speaker naming failed ({type(e).__name__})", file=sys.stderr)
                         degraded.append("speaker naming failed (labels stay SPEAKER_xx)")
             except Exception as e:
                 # Best-effort like OCR: speaker labels are never worth losing the transcript.
-                print(f"warning: diarization failed ({cfg.diarize_model}): {e}", file=sys.stderr)
+                print(f"warning: diarization failed ({cfg.diarize_model}, {type(e).__name__})", file=sys.stderr)
                 # ...but never at the price of a memory that already has them: an unlabelled
                 # re-ingest would silently replace good speaker attribution.
                 if any(r.get("speaker", "SPEAKER_0") != "SPEAKER_0"
@@ -180,7 +186,7 @@ def _ingest_locked(video_path, cfg, store, project_id, title, mem_dir) -> int:
                 except Exception as e:
                     # OCR is best-effort: a slow/broken vision backend must not discard the
                     # (valuable) transcript. Degrade this frame to no on-screen text and warn.
-                    print(f"warning: OCR failed for {state.frame_path}: {e}", file=sys.stderr)
+                    print(f"warning: OCR failed for {state.frame_path} ({type(e).__name__})", file=sys.stderr)
                     state.on_screen_text = ""
                     ocr_failures += 1
         if ocr_failures:

@@ -32,7 +32,7 @@ def _mcp_session(app):
             },
         })
         assert response.status_code == 200
-        headers["mcp-session-id"] = response.headers["mcp-session-id"]
+        assert "mcp-session-id" not in response.headers  # stateless tools need no server session
         headers["mcp-protocol-version"] = "2025-06-18"
         response = client.post("/mcp", headers=headers,
                                json={"jsonrpc": "2.0", "method": "notifications/initialized"})
@@ -171,3 +171,29 @@ def test_mcp_backend_failures_are_safe_and_session_recovers(name, field, kind, d
         assert "secret-token" not in json.dumps(result)
         assert request("tools/call", args)["isError"] is False
     assert "secret-token" not in caplog.text
+
+
+def test_repeated_initializations_do_not_retain_mcp_sessions(monkeypatch):
+    from mcp.server.fastmcp import FastMCP
+
+    servers = []
+    original = FastMCP.streamable_http_app
+
+    def capture(self):
+        servers.append(self)
+        return original(self)
+
+    monkeypatch.setattr(FastMCP, "streamable_http_app", capture)
+    app = _app()
+    headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+    with TestClient(app) as client:
+        for number in range(20):
+            response = client.post("/mcp/", headers=headers, json={
+                "jsonrpc": "2.0", "id": number, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": {"name": "short-lived-client", "version": "1"},
+                },
+            })
+            assert response.status_code == 200
+            assert "mcp-session-id" not in response.headers
+        assert servers[0].session_manager._server_instances == {}

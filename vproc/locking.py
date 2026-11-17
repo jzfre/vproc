@@ -14,7 +14,7 @@ class IndexWriteLock:
 
     def __init__(self, directory, *, name=".vproc-write.lock"):
         self.directory = Path(directory).expanduser().resolve()
-        self._lock = FileLock(self.directory / name, timeout=0)
+        self._lock = FileLock(self.directory / name, timeout=0, preserve_lock_file=True)
 
     def __enter__(self):
         self.directory.mkdir(parents=True, exist_ok=True)

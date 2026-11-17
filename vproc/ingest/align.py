@@ -46,7 +46,8 @@ def make_embed_text(on_screen: str, segs: list[TranscriptSegment]) -> str:
 
 
 # Sub-split long monologues so one near-static screen doesn't collapse into a single
-# un-citable blob. Each emitted segment spans at most MAX_WINDOW_S seconds.
+# un-citable blob. Whole ASR segments are grouped into MAX_WINDOW_S windows;
+# a single longer segment cannot be time-split without aligned word timestamps.
 MAX_WINDOW_S = 90.0
 
 
@@ -68,8 +69,8 @@ def _subsplit(segs: list[TranscriptSegment], max_window: float) -> list[list[Tra
 def _make_segment(project_id: str, memory_id: str, source_video: str,
                   s: ScreenState, segs: list[TranscriptSegment]) -> Segment:
     said = " ".join(x.text for x in segs)
-    start = segs[0].start if segs else s.t_start
-    end = segs[-1].end if segs else s.t_end
+    start = min(x.start for x in segs) if segs else s.t_start
+    end = max(x.end for x in segs) if segs else s.t_end
     speaker = segs[0].speaker if segs else "SPEAKER_0"
     return Segment(
         id=str(uuid.uuid4()),
@@ -96,4 +97,4 @@ def build_segments(project_id: str, memory_id: str, source_video: str,
             continue
         for chunk in _subsplit(segs, max_window):
             out.append(_make_segment(project_id, memory_id, source_video, s, chunk))
-    return out
+    return sorted(out, key=lambda segment: segment.start_ts)

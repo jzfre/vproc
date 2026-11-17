@@ -820,3 +820,92 @@ def test_invalid_asr_timestamps_preserve_previous_memory_and_frames(tmp_path, mo
         P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
     assert store.calls == [] and store.rows == old_rows
     assert all(pathlib.Path(path).read_bytes() == data for path, data in old_frames.items())
+
+
+def test_empty_diarization_preserves_existing_speaker_labels(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path)
+    monkeypatch.setattr(P.D, "diarize", lambda *a: [])
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "fake"
+    store = FakeStore()
+    store.rows = [{"memory_id": "standup", "id": "old", "speaker": "Ada", "frame_path": ""}]
+    with pytest.raises(ValueError, match="already has speaker labels"):
+        P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    assert store.calls == [] and store.rows[0]["speaker"] == "Ada"
+
+
+def test_empty_diarization_reports_degraded_new_memory(tmp_path, monkeypatch, capsys):
+    _patch(monkeypatch, tmp_path)
+    monkeypatch.setattr(P.D, "diarize", lambda *a: [])
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model = "fake"
+    assert P.ingest_video("/videos/standup.mp4", cfg=cfg, store=FakeStore()) > 0
+    assert "DEGRADED: diarization failed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("stage", ["ocr", "diarize", "naming"])
+def test_best_effort_model_failures_never_print_backend_response(tmp_path, monkeypatch, capsys, stage):
+    from vproc.ingest.diarize import SpeakerTurn
+    _patch(monkeypatch, tmp_path)
+    cfg = _cfg(tmp_path)
+    cfg.diarize_model, cfg.speaker_naming = "fake", True
+    monkeypatch.setattr(P.D, "diarize", lambda *a: [SpeakerTurn(0, 30, "SPEAKER_00")])
+    monkeypatch.setattr(P.N, "sample_name_votes", lambda *a: [])
+    def fail(*a, **kw):
+        raise RuntimeError("Bearer private-key https://secret.example/token confidential transcript")
+    module, attr = {"ocr": (P.O, "ocr_frame"), "diarize": (P.D, "diarize"),
+                    "naming": (P.N, "sample_name_votes")}[stage]
+    monkeypatch.setattr(module, attr, fail)
+    assert P.ingest_video("/videos/standup.mp4", cfg=cfg, store=FakeStore()) > 0
+    output = capsys.readouterr()
+    assert "RuntimeError" in output.err
+    assert "private-key" not in output.err + output.out
+    assert "confidential transcript" not in output.err + output.out
+
+
+@pytest.mark.parametrize("stage", ["transcribe", "embed"])
+def test_fatal_ingest_backend_errors_are_sanitized_and_preserve_rows(tmp_path, monkeypatch, stage):
+    from openai import OpenAIError
+    from vproc.errors import IngestError
+    _patch(monkeypatch, tmp_path)
+    def fail(*args, **kwargs):
+        raise OpenAIError("Bearer private-key confidential transcript")
+    module, attr = (P.T, "transcribe") if stage == "transcribe" else (P.EI, "embed_rows")
+    monkeypatch.setattr(module, attr, fail)
+    store = FakeStore()
+    store.rows = [{"id": "old", "memory_id": "standup"}]
+    with pytest.raises(IngestError) as exc:
+        P.ingest_video("/videos/standup.mp4", cfg=_cfg(tmp_path), store=store)
+    assert "OpenAIError" in str(exc.value) and "private-key" not in str(exc.value)
+    assert store.rows == [{"id": "old", "memory_id": "standup"}] and store.calls == []
+
+
+def test_interrupted_frame_staging_preserves_old_generation_and_cleans_workspace(tmp_path, monkeypatch):
+    _patch(monkeypatch, tmp_path)
+    cfg, store = _cfg(tmp_path), FakeStore()
+    P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    previous = list(store.rows)
+    old_frames = {r["frame_path"]: pathlib.Path(r["frame_path"]).read_bytes() for r in previous}
+    workdirs = []
+    make_temp = P.tempfile.mkdtemp
+    def make_workdir(*args, **kwargs):
+        path = make_temp(*args, **kwargs)
+        workdirs.append(path)
+        return path
+    monkeypatch.setattr(P.tempfile, "mkdtemp", make_workdir)
+    _patch(monkeypatch, tmp_path)
+    moved = []
+    move = P.shutil.move
+    def interrupt_second_move(src, dst):
+        if moved:
+            raise KeyboardInterrupt()
+        move(src, dst)
+        moved.append(dst)
+    monkeypatch.setattr(P.shutil, "move", interrupt_second_move)
+    with pytest.raises(KeyboardInterrupt):
+        P.ingest_video("/videos/standup.mp4", cfg=cfg, store=store)
+    assert store.rows == previous
+    assert all(pathlib.Path(path).read_bytes() == data for path, data in old_frames.items())
+    assert all(not os.path.exists(path) for path in workdirs)
+    # Interrupted staging may leave an orphan, but must not delete any old generation.
+    assert moved and all(os.path.exists(path) for path in moved)

@@ -305,3 +305,17 @@ def test_online_skips_the_hub_for_a_local_diarization_pipeline_file(doctor, cfg,
     probes, _ = _probes(hub=hub_must_not_run)
     assert doctor.run_doctor(replace(cfg, diarize_model=str(local)), online=True, probes=probes) == 0
     assert "local pipeline" in capsys.readouterr().out
+
+
+def test_embedding_probe_uses_short_timeout(monkeypatch, cfg):
+    from vproc.llm import client
+
+    called = {}
+
+    def embed(base_url, model, texts, *, timeout=None):
+        called["timeout"] = timeout
+        return [[1.0, 0.0]]
+
+    monkeypatch.setattr(client, "embed_texts", embed)
+    assert doctor_module._default_probes()["embed"](cfg) == 2
+    assert called["timeout"] == 15.0

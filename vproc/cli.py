@@ -3,6 +3,8 @@ from importlib import metadata
 from pathlib import Path
 import tomllib
 
+from openai import OpenAIError
+
 from vproc.config import load_config, load_dotenv
 from vproc.errors import IndexBusyError, IngestError
 from vproc.locking import IndexWriteLock
@@ -69,7 +71,13 @@ def _speakers(args: list[str]) -> None:
                 sys.exit(1)
             m["mapping"][old] = new
             m["suggestions"].pop(old, None)
-            N.save_speaker_map(mem_dir, m)
+            try:
+                N.save_speaker_map(mem_dir, m)
+            except OSError:
+                # The authoritative rows committed already. A convenience sidecar
+                # cannot roll that transaction back; report the actual outcome.
+                print("warning: index was updated, but the speaker map could not be saved; "
+                      "check frame-directory permissions and disk space.", file=sys.stderr)
             print(f"renamed {old} -> {new} in '{memory}' ({n} rows)")
         return
     try:
@@ -121,6 +129,10 @@ def _print_speaker_summary(rows: list[dict]) -> None:
 def main() -> None:
     try:
         _main(sys.argv[1:])
+    except OpenAIError as e:
+        print(f"error: model backend failed ({type(e).__name__}); check its service, configuration, "
+              "and credentials, or run 'vproc doctor --online'.", file=sys.stderr)
+        sys.exit(1)
     except (IndexBusyError, IngestError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)

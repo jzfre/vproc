@@ -68,3 +68,19 @@ def test_build_segments_splits_on_speaker_change_within_screen_state():
     assert len(segs) == 2
     assert segs[0].speaker == "SPEAKER_0" and segs[0].said_text == "alice speaking"
     assert segs[1].speaker == "SPEAKER_1" and segs[1].said_text == "bob replying"
+
+
+def test_overlapping_segments_keep_the_full_citation_interval():
+    states = build_screen_states([RawFrame("a.png", 0)], end_time=120)
+    # Some ASR segments overlap; the latest-starting segment need not end last.
+    out = build_segments("p", "m", "v", states, [TS(0, 80, "long"), TS(10, 20, "short")])
+    assert len(out) == 1
+    assert (out[0].start_ts, out[0].end_ts) == (0, 80)
+    assert out[0].said_text == "long short"
+
+
+def test_output_remains_chronological_when_midpoints_reorder_screen_buckets():
+    states = build_screen_states([RawFrame("a.png", 0), RawFrame("b.png", 10)], end_time=30)
+    out = build_segments("p", "m", "v", states, [TS(0, 30, "long"), TS(2, 3, "short")])
+    assert [s.start_ts for s in out] == [0, 2]
+    assert [s.frame_path for s in out] == ["b.png", "a.png"]

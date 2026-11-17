@@ -50,7 +50,8 @@ def analyze_memory(store, cfg, memory_id: str, question: str,
         think=False,
     )
     try:
-        return json.loads(raw)["answer"]
+        answer = json.loads(raw)["answer"]
+        return answer.strip() if isinstance(answer, str) and answer.strip() else "(model returned no answer)"
     except (ValueError, KeyError, TypeError):
         # Fall back to whatever the model returned rather than crashing the CLI.
         return raw.strip() or "(model returned no answer)"

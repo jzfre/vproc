@@ -2,8 +2,8 @@ import logging
 import os
 import re
 import unicodedata
-from pathlib import Path
-from threading import Lock
+from contextlib import contextmanager
+from threading import BoundedSemaphore, Lock
 
 from fastapi import FastAPI, HTTPException
 from openai import APIError, APITimeoutError
@@ -12,7 +12,9 @@ from pydantic import BaseModel
 from vproc.answer.ask import ask_memory, search_memory
 from vproc.config import load_config
 from vproc.errors import IndexBusyError, IndexCompatibilityError
+from vproc.http_limits import QueryBodyLimit
 from vproc.llm import client
+from vproc.paths import memory_directory
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,21 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
     if store is None:
         from vproc.store.lancedb_store import Store
         store = Store(cfg.index_path)
+    query_slots = BoundedSemaphore(getattr(cfg, "max_concurrent_queries", 4))
+
+    @contextmanager
+    def query_slot():
+        # Do not let minutes-long model calls occupy every shared ASGI worker.
+        # REST and MCP use this same gate. A disconnected caller still holds its
+        # slot until backend work finishes; freeing it early would bypass the cap.
+        if not query_slots.acquire(blocking=False):
+            raise HTTPException(status_code=503, detail="Model request capacity reached. Retry shortly.",
+                                headers={"Retry-After": "1"})
+        try:
+            yield
+        finally:
+            query_slots.release()
+
     verifier_state = None  # stays None with an injected scorer: nothing local to load
     ensure_verifier = None
     if scorer is None:
@@ -131,24 +148,27 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
     def ask_route(q: Query):
         question = _query_text(q.question, "question")
         where = build_where(q)
-        if ensure_verifier is not None:
-            # Load the gate BEFORE the (possibly minutes-long) generation: a verifier that
-            # cannot load must fail in seconds, not after every full generation.
-            ensure_verifier()
-        return _backend(lambda: ask(store, cfg, question, scorer, where=where).model_dump())
+        with query_slot():
+            if ensure_verifier is not None:
+                # Load the gate BEFORE the (possibly minutes-long) generation: a verifier that
+                # cannot load must fail in seconds, not after every full generation.
+                ensure_verifier()
+            return _backend(lambda: ask(store, cfg, question, scorer, where=where).model_dump())
 
     def search_route(q: Query):
         query = _query_text(q.query if q.query is not None else q.question, "query")
         where = build_where(q)
-        return _backend(lambda: [e.model_dump() for e in search(store, cfg, query, where=where)])
+        with query_slot():
+            return _backend(lambda: [e.model_dump() for e in search(store, cfg, query, where=where)])
 
     mcp_app, lifespan = _build_mcp(ask_route, search_route)
     app = FastAPI(title="vproc", lifespan=lifespan)
+    app.add_middleware(QueryBodyLimit)
     app.post("/ask")(ask_route)
     app.post("/search")(search_route)
 
     @app.get("/healthz")
-    def healthz():
+    async def healthz():
         return {"ok": True}
 
     @app.get("/api/status")
@@ -169,8 +189,11 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
 
     @app.get("/api/memories")
     def api_memories():
+        summaries = getattr(store, "memory_summaries", None)
+        if summaries is not None:
+            return _backend(lambda: summaries("default"))
         by_mem: dict[str, list[dict]] = {}
-        for r in store.all_rows():
+        for r in _backend(store.all_rows):
             if r.get("project_id", "default") == "default":
                 by_mem.setdefault(r["memory_id"], []).append(r)
         return [
@@ -184,7 +207,7 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
     def api_segments(memory_id: str):
         # memory_rows escapes its own SQL values; pass the original identifier.
         _safe(memory_id, "memory")
-        rows = store.memory_rows(memory_id, "default")
+        rows = _backend(lambda: store.memory_rows(memory_id, "default"))
         if not rows:
             raise HTTPException(status_code=404, detail=f"no memory '{memory_id}'")
         rows.sort(key=lambda r: r["start_ts"])
@@ -198,7 +221,7 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
     @app.get("/api/media/{memory_id}")
     def api_media(memory_id: str):
         _safe(memory_id, "memory")
-        rows = store.memory_rows(memory_id, "default")
+        rows = _backend(lambda: store.memory_rows(memory_id, "default"))
         if not rows:
             raise HTTPException(status_code=404, detail=f"no memory '{memory_id}'")
         path = rows[0]["source_video"]
@@ -212,16 +235,17 @@ def create_app(store=None, scorer=None, cfg=None, ask=ask_memory, search=search_
 
     @app.get("/api/frames/{memory_id}/{name}")
     def api_frame(memory_id: str, name: str):
-        # The character-class regex alone is NOT sufficient: it allows dots, so a name of
-        # ".." or "..png" (no slash needed) passes it — the explicit ".." check is what
-        # actually blocks those. memory_id can't contain "/" either, but a bare ".."
-        # segment (e.g. from "%2e%2e") would still resolve one level up via
-        # os.path.join, so it gets the same explicit check.
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or ".." in name or ".." in memory_id:
+        # Reuse ingest's identifier/symlink policy; names such as "draft..v2"
+        # are valid memories. Serve only PNG frames, never speaker sidecars.
+        if not re.fullmatch(r"[A-Za-z0-9._-]+\.png", name) or ".." in name:
             raise HTTPException(status_code=404, detail="bad frame name")
-        root = (Path(cfg.frames_dir).expanduser() / "default").resolve()
-        path = (root / memory_id / name).resolve()
-        if not path.is_relative_to(root) or not path.is_file():
+        try:
+            directory = memory_directory(cfg.frames_dir, "default", memory_id)
+            path = directory / name
+            resolved = path.resolve()
+        except (ValueError, OSError, RuntimeError):
+            raise HTTPException(status_code=404, detail="bad frame name") from None
+        if resolved != path or not path.is_file():
             raise HTTPException(status_code=404, detail="no such frame")
         from starlette.responses import FileResponse
         return FileResponse(path, media_type="image/png")
@@ -265,7 +289,9 @@ def _build_mcp(ask, search):
         from mcp.server.fastmcp.exceptions import ToolError
         from mcp.server.transport_security import TransportSecuritySettings
 
-        mcp = FastMCP("vproc")
+        # Tools have no per-client state. Avoid retaining one long-lived server
+        # and initialization payload for every client that ever connects.
+        mcp = FastMCP("vproc", stateless_http=True)
 
         async def run_tool(call, q):
             try:

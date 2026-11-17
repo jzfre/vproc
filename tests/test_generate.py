@@ -97,3 +97,33 @@ def test_claims_are_bounded_in_the_schema_and_in_code():
                          "grounding_max_tokens": 64, "grounding_thinking": False})()
     out = G.generate(cfg, "q", "[E1] evidence", chat=lambda *a, **k: json.dumps(many))
     assert [c["text"] for c in out["claims"]] == [f"claim {i}" for i in range(G.MAX_CLAIMS)]
+
+
+def test_generate_skips_json_schema_in_reasoning_before_final_answer():
+    raw = ('First inspect {"type": "object", "properties": {"answered": {"type": "boolean"}}}. '
+           'Final: {"answered": true, "claims": [{"text": "ships in July", "evidence_ids": ["E1"]}]}')
+    result = generate(_cfg(), "q", '[E1] "ships in July"', chat=lambda *a, **k: raw)
+    assert result["answered"] is True
+    assert result["claims"][0]["text"] == "ships in July"
+
+
+def test_generate_uses_final_answer_after_a_reasoning_draft():
+    raw = ('<think>{"answered": true, "claims": [{"text": "draft claim", "evidence_ids": ["E1"]}]}</think>\n'
+           '{"answered": false, "claims": []}')
+    result = generate(_cfg(), "q", '[E1] "ships in July"', chat=lambda *a, **k: raw)
+    assert result == {"answered": False, "claims": []}
+
+
+def test_generate_does_not_answer_from_unclosed_reasoning():
+    raw = '<think>{"answered": true, "claims": [{"text": "draft claim", "evidence_ids": ["E1"]}]}'
+    result = generate(_cfg(), "q", '[E1] "ships in July"', chat=lambda *a, **k: raw)
+    assert result == {"answered": False, "claims": []}
+
+
+def test_generate_uses_final_top_level_object_not_nested_claim_json():
+    # The claim itself can quote JSON. Its braces cannot be reinterpreted as another answer.
+    final = {"answered": True, "claims": [{
+        "text": 'The literal payload is {"answered": false, "claims": []}.', "evidence_ids": ["E1"]}]}
+    raw = 'Example: {"answered": false, "claims": []}\nFinal: ' + json.dumps(final)
+    result = generate(_cfg(), "q", "[E1] quoted payload", chat=lambda *a, **k: raw)
+    assert result == final

@@ -4,7 +4,7 @@ import sys
 import wave
 from dataclasses import dataclass
 
-from vproc.ingest.transcribe import TranscriptSegment, _collapse_repetition
+from vproc.ingest.transcribe import TranscriptSegment, _collapse_repetition, _timestamp
 
 
 @dataclass
@@ -190,6 +190,20 @@ def assign_speakers(transcript: list[TranscriptSegment],
     leaves labels untouched."""
     if not turns:
         return transcript
+    # Validate the entire result before mutating any transcript labels. A corrupt
+    # turn must enter the ingest's degradation/preservation path, not misattribute
+    # words through NaN comparisons or leave a partly labelled transcript.
+    validated: list[SpeakerTurn] = []
+    for turn in turns:
+        try:
+            start, end = _timestamp(turn.start), _timestamp(turn.end)
+            if (end < start or not isinstance(turn.speaker, str) or not turn.speaker.strip()
+                    or any(ord(c) < 32 or ord(c) == 127 for c in turn.speaker)):
+                raise ValueError("Invalid turn")
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            raise ValueError("Invalid speaker turn returned by diarization") from None
+        validated.append(SpeakerTurn(start, end, turn.speaker))
+    turns = validated
     out: list[TranscriptSegment] = []
     worded: list[TranscriptSegment] = []  # consecutive segments that carry word timestamps
     for seg in transcript:

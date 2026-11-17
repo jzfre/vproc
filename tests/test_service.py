@@ -539,3 +539,78 @@ def test_backend_failure_log_carries_the_http_status_but_never_the_body(caplog):
         assert client.post("/ask", json={"question": "q"}).status_code == 503
     assert "APIStatusError" in caplog.text and "503" in caplog.text
     assert "secret-token" not in caplog.text
+
+
+def test_frame_read_uses_same_valid_memory_names_as_ingest(tmp_path):
+    from vproc.paths import memory_directory
+
+    cfg = _cfg_with(_cfg(), frames_dir=str(tmp_path / "frames"))
+    folder = memory_directory(cfg.frames_dir, "default", "planning..draft")
+    folder.mkdir(parents=True)
+    (folder / "frame.png").write_bytes(b"png")
+    client = TestClient(create_app(store=_UIStore([]), scorer=lambda *_: 1, cfg=cfg))
+    assert client.get("/api/frames/planning..draft/frame.png").status_code == 200
+
+
+def test_frame_route_rejects_sidecars_and_symlinked_project(tmp_path):
+    cfg = _cfg_with(_cfg(), frames_dir=str(tmp_path / "frames"))
+    root = tmp_path / "frames"
+    root.mkdir()
+    outside = tmp_path / "outside" / "meeting"
+    outside.mkdir(parents=True)
+    (outside / "frame.png").write_bytes(b"outside")
+    (root / "default").symlink_to(outside.parent, target_is_directory=True)
+    client = TestClient(create_app(store=_UIStore([]), scorer=lambda *_: 1, cfg=cfg))
+    assert client.get("/api/frames/meeting/frame.png").status_code == 404
+    (root / "default").unlink()
+    folder = root / "default" / "meeting"
+    folder.mkdir(parents=True)
+    (folder / "speakers.json").write_text('{"private":"sidecar"}')
+    assert client.get("/api/frames/meeting/speakers.json").status_code == 404
+
+
+def test_model_requests_fail_fast_at_capacity_and_release_slots():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    entered, release = Event(), Event()
+
+    def answer(*args, **kwargs):
+        entered.set()
+        assert release.wait(5), "test never released model call"
+        raise RuntimeError("backend failed")
+
+    cfg = _cfg_with(_cfg(), max_concurrent_queries=1)
+    app = create_app(store=_UIStore([]), scorer=lambda *_: 1, cfg=cfg,
+                     ask=answer, search=lambda *a, **kw: [])
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as pool:
+        pending = pool.submit(client.post, "/ask", json={"question": "slow"})
+        try:
+            assert entered.wait(5)
+            for path, body in [("/ask", {"question": "next"}), ("/search", {"query": "next"})]:
+                rejected = client.post(path, json=body)
+                assert rejected.status_code == 503
+                assert rejected.headers["retry-after"] == "1"
+            assert client.get("/healthz").json() == {"ok": True}
+            assert client.get("/api/memories").json() == []
+        finally:
+            release.set()
+        assert pending.result(timeout=5).status_code == 500
+        assert client.post("/search", json={"query": "now free"}).status_code == 200
+
+
+@pytest.mark.parametrize("route", ["/api/memories", "/api/memories/m/segments", "/api/media/m"])
+def test_metadata_backend_errors_are_sanitized(route, caplog):
+    class BrokenStore:
+        def all_rows(self):
+            raise RuntimeError("private transcript or credentials")
+
+        def memory_rows(self, *args):
+            return self.all_rows()
+
+    client = TestClient(create_app(store=BrokenStore(), scorer=lambda *_: 1, cfg=_cfg()),
+                        raise_server_exceptions=False)
+    response = client.get(route)
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Request failed. Check the service logs and retry."
+    assert "private transcript" not in caplog.text

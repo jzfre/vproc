@@ -75,7 +75,11 @@ def _words(raw, text: str, start: float, end: float) -> list[tuple[float, float,
 
 def segments_from_whisper(result: dict) -> list[TranscriptSegment]:
     out: list[TranscriptSegment] = []
+    if not isinstance(result, dict) or not isinstance(result.get("segments", []), list):
+        raise IngestError("ASR returned malformed segments; check the transcription backend.")
     for s in result.get("segments", []):
+        if not isinstance(s, dict) or (s.get("text") is not None and not isinstance(s["text"], str)):
+            raise IngestError("ASR returned malformed segment text; check the transcription backend.")
         raw_text = (s.get("text") or "").strip()
         text = _collapse_repetition(raw_text)
         if text:
@@ -113,7 +117,7 @@ def _transcribe_local(audio_path: str, model: str, transcriber=None) -> dict:
         return run(True)  # word times let diarization attribute speakers per sentence
     except Exception as e:
         # Word times improve speaker attribution; they are never worth losing the transcript.
-        print(f"warning: transcription with word timestamps failed ({type(e).__name__}: {e}); "
+        print(f"warning: transcription with word timestamps failed ({type(e).__name__}); "
               "retrying without them", file=sys.stderr)
         return run(False)
 

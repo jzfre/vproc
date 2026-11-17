@@ -19,22 +19,36 @@ def _literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _vector_dimension(vectors) -> int:
-    dimension = None
-    for vector in vectors:
-        if not isinstance(vector, (list, tuple)) or not vector:
-            raise ValueError("Each embedding vector must be a nonempty list of numbers")
-        if any(isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value)
-               for value in vector):
-            raise ValueError("Each embedding vector must contain only finite numbers")
-        # Cosine similarity is undefined for zero vectors. Lance silently omits
-        # them from search, so accepting one would hide otherwise valid evidence.
-        if not any(vector):
-            raise ValueError("Each embedding vector must be nonzero for cosine search")
-        if dimension is not None and len(vector) != dimension:
-            raise ValueError("Embedding vector dimensions must match")
-        dimension = len(vector)
-    return dimension
+def _unit_vector(vector) -> list[float]:
+    """Cosine is scale invariant; normalize before Lance's float32 conversion.
+
+    Finite Python floats can overflow/underflow in float32 or its squared norm.
+    Scaling first keeps even extreme finite magnitudes searchable without changing
+    direction. Existing ordinary unnormalized indexes remain compatible.
+    """
+    if not isinstance(vector, (list, tuple)) or not vector:
+        raise ValueError("Each embedding vector must be a nonempty list of numbers")
+    try:
+        if any(isinstance(value, bool) or not isinstance(value, Real) for value in vector):
+            raise ValueError
+        values = [float(value) for value in vector]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError
+    except (ValueError, OverflowError):
+        raise ValueError("Each embedding vector must contain only finite numbers") from None
+    scale = max(abs(value) for value in values)
+    if not scale:
+        raise ValueError("Each embedding vector must be nonzero for cosine search")
+    scaled = [value / scale for value in values]
+    norm = math.hypot(*scaled)
+    return [value / norm for value in scaled]
+
+
+def _normalized_rows(rows: list[dict]) -> list[dict]:
+    out = [{**row, "vector": _unit_vector(row.get("vector"))} for row in rows]
+    if len({len(row["vector"]) for row in out}) != 1:
+        raise ValueError("Embedding vector dimensions must match")
+    return out
 
 
 class Store:
@@ -136,7 +150,8 @@ class Store:
         if not rows:
             return
         with self._writer_lock:
-            dimension = _vector_dimension(row.get("vector") for row in rows)
+            rows = _normalized_rows(rows)
+            dimension = len(rows[0]["vector"])
             table = self._table()
             self._validate_write(table, embedding_model, dimension)
             if table is None:
@@ -165,7 +180,8 @@ class Store:
                 if not isinstance(sid, str) or not sid.strip() or sid in ids:
                     raise ValueError("Replacement row ids must be nonempty and unique")
                 ids.add(sid)
-            dimension = _vector_dimension(row.get("vector") for row in rows)
+            rows = _normalized_rows(rows)
+            dimension = len(rows[0]["vector"])
             table = self._table()
             self._validate_embedding_model(table, embedding_model, dimension)
             if table is None:
@@ -227,7 +243,7 @@ class Store:
                 where += f" AND project_id = '{safe_proj}'"
             # Pre-query so a lancedb without UpdateResult.rows_updated can still report a count —
             # querying by old_speaker after the update would find nothing (already renamed).
-            pending = len(table.search().where(where, prefilter=True).to_list())
+            pending = table.count_rows(where)
             result = table.update(where=where, values={"speaker": new_speaker})
             rows_updated = getattr(result, "rows_updated", None)
             return rows_updated if rows_updated is not None else pending
@@ -235,16 +251,21 @@ class Store:
     def vector_search(self, vector, k: int, where: str | None = None,
                       *, embedding_model: str | None = None) -> list[dict]:
         table = self._table()
+        if embedding_model is not None or table is not None:
+            vector = _unit_vector(vector)
         if embedding_model is not None:
-            self._validate_embedding_model(table, embedding_model, _vector_dimension([vector]))
+            self._validate_embedding_model(table, embedding_model, len(vector))
         if table is None:
             return []
-        if embedding_model is None:
-            _vector_dimension([vector])
         q = table.search(vector).metric("cosine").limit(k)
         if where:
             q = q.where(where, prefilter=True)
-        return q.to_list()
+        hits = q.to_list()
+        if any(not math.isfinite(hit["_distance"]) for hit in hits):
+            raise IndexCompatibilityError(
+                f"Index contains invalid cosine distances. {_REBUILD_GUIDANCE}"
+            )
+        return hits
 
     def fts_search(self, text: str, k: int, where: str | None = None) -> list[dict]:
         table = self._table()
@@ -258,6 +279,30 @@ class Store:
         except Exception:
             log.warning("FTS search failed; continuing with vector results.")
             return []
+
+    def memory_summaries(self, project_id: str = "default") -> list[dict]:
+        """Catalogue metadata without loading transcript text or embeddings.
+
+        Iterate projected batches so memory use grows with the catalogue, not the
+        total number or size of transcript chunks in the library.
+        """
+        table = self._table()
+        if table is None:
+            return []
+        query = (table.search().where(f"project_id = {_literal(project_id)}")
+                 .select(["memory_id", "speaker", "end_ts"]).limit(None))
+        summaries = {}
+        for batch in query.to_batches(batch_size=1024):
+            for row in batch.to_pylist():
+                mid = row["memory_id"]
+                summary = summaries.setdefault(mid, {
+                    "memory_id": mid, "segment_count": 0, "duration_s": row["end_ts"], "speakers": set(),
+                })
+                summary["segment_count"] += 1
+                summary["duration_s"] = max(summary["duration_s"], row["end_ts"])
+                summary["speakers"].add(row["speaker"])
+        return [{**summary, "speakers": sorted(summary["speakers"])}
+                for _, summary in sorted(summaries.items())]
 
     def all_rows(self) -> list[dict]:
         """Every row's metadata, without reading embeddings from storage."""

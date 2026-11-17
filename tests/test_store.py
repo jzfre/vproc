@@ -417,3 +417,104 @@ def test_zero_query_embedding_is_an_error_not_empty_results(tmp_path, embedding_
     store.add([_row("old", "p", [1.0, 0.0])], embedding_model="model-a")
     with pytest.raises(ValueError, match="nonzero"):
         store.vector_search([0.0, -0.0], 1, embedding_model=embedding_model)
+
+
+@pytest.mark.parametrize("magnitude", [1e300, 1e20, 1e-30, 1e-300])
+@pytest.mark.parametrize("model", [None, "model-a"])
+def test_finite_embedding_scale_does_not_corrupt_cosine_search(tmp_path, magnitude, model):
+    import math
+
+    store = Store(str(tmp_path / "db"))
+    original = [_row("near", "p", [magnitude, magnitude]),
+                _row("far", "p", [-magnitude, magnitude])]
+    store.add(original, embedding_model=model)
+    # Caller-owned rows remain unchanged; the stored representation is unit length.
+    assert original[0]["vector"] == [magnitude, magnitude]
+    rows = store._table().to_arrow().to_pylist()
+    assert all(math.hypot(*r["vector"]) == pytest.approx(1., abs=1e-6) for r in rows)
+    for query in ([1., 1.], [magnitude, magnitude]):
+        hits = store.vector_search(query, 2, embedding_model=model)
+        assert [h["id"] for h in hits] == ["near", "far"]
+        assert hits[0]["_distance"] == pytest.approx(0., abs=1e-6)
+        assert hits[1]["_distance"] == pytest.approx(1., abs=1e-6)
+
+
+def test_replacement_normalizes_vectors_and_keeps_identity(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    store.add([_row("old", "p", [1., 0.])], embedding_model="model-a")
+    store.replace_memory("m", "p", [_row("new", "p", [1e-300, 0.])], "model-a")
+    store.validate_embedding_model("model-a", 2)
+    hit = store.vector_search([1e300, 0.], 1, embedding_model="model-a")[0]
+    assert hit["id"] == "new" and hit["_distance"] == pytest.approx(0.)
+
+
+def test_query_normalization_works_with_existing_unnormalized_vectors(tmp_path):
+    store = Store(str(tmp_path / "db"))
+    # Simulate a pre-normalization index with ordinary finite vectors.
+    store._create_table([_row("old", "p", [3., 4.])], "model-a", 2)
+    before = store._table().version
+    hit = store.vector_search([3e200, 4e200], 1, embedding_model="model-a")[0]
+    assert hit["_distance"] == pytest.approx(0., abs=1e-6)
+    assert store._table().version == before  # reads do not migrate existing indexes
+
+
+def test_speaker_update_fallback_counts_all_rows_without_loading_vectors(tmp_path, monkeypatch):
+    from lancedb.table import LanceTable
+
+    store = Store(str(tmp_path / "db"))
+    store.add([_row(str(i), "p", [1., 0.]) for i in range(25)], embedding_model="m")
+    original = LanceTable.update
+
+    def update_without_result(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        return None  # supported older Lance versions provide no rows_updated
+
+    monkeypatch.setattr(LanceTable, "update", update_without_result)
+    def no_scan(*args, **kwargs):
+        raise AssertionError("A rename must count rows without materializing embeddings")
+    with monkeypatch.context() as patch:
+        patch.setattr(LanceTable, "search", no_scan)
+        assert store.update_speaker("m", "p", "SPEAKER_0", "Ada") == 25
+    assert {r["speaker"] for r in store.memory_rows("m", "p")} == {"Ada"}
+
+
+def test_memory_summaries_stream_projected_metadata_and_scope_to_project(tmp_path, monkeypatch):
+    from lancedb.query import LanceEmptyQueryBuilder
+
+    store = Store(str(tmp_path / "db"))
+    assert store.memory_summaries() == []
+    rows = [{**_row(str(i), "owner's project", [1., 0.]),
+             "memory_id": "meeting", "speaker": "Ada" if i % 2 else "Bo",
+             "end_ts": float(i + 1)} for i in range(1100)]
+    rows += [{**_row("other-memory", "owner's project", [1., 0.]),
+              "memory_id": "aaa", "end_ts": 5.},
+             _row("other-project", "default", [1., 0.])]
+    store.add(rows, embedding_model="m")
+    original = LanceEmptyQueryBuilder.to_batches
+    batch_counts = []
+
+    def checked_batches(self, *args, **kwargs):
+        batches = original(self, *args, **kwargs)
+        for batch in batches:
+            assert set(batch.schema.names) == {"memory_id", "speaker", "end_ts"}
+            assert batch.num_rows <= 1024
+            batch_counts.append(batch.num_rows)
+            yield batch
+
+    monkeypatch.setattr(LanceEmptyQueryBuilder, "to_batches", checked_batches)
+    assert store.memory_summaries("owner's project") == [
+        {"memory_id": "aaa", "segment_count": 1, "duration_s": 5., "speakers": ["SPEAKER_0"]},
+        {"memory_id": "meeting", "segment_count": 1100, "duration_s": 1100., "speakers": ["Ada", "Bo"]},
+    ]
+    assert len(batch_counts) >= 2 and sum(batch_counts) == 1101
+    assert store.memory_summaries("' OR true OR project_id = '") == []
+
+
+def test_existing_underflowed_index_cannot_return_nonfinite_similarity(tmp_path):
+    from vproc.errors import IndexCompatibilityError
+
+    store = Store(str(tmp_path / "db"))
+    # Old versions accepted values whose float32 squared norm underflows to zero.
+    store._create_table([_row("bad", "p", [1e-30, 0.])], "model-a", 2)
+    with pytest.raises(IndexCompatibilityError, match="re-ingest"):
+        store.vector_search([1., 0.], 1, embedding_model="model-a")

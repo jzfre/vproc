@@ -1,0 +1,211 @@
+{
+  "segments": [
+    {
+      "id": "release-date",
+      "memory_id": "planning",
+      "speaker": "Ada",
+      "start_ts": 12,
+      "end_ts": 24,
+      "said_text": "The Aurora release ships on July 17. The approval is final. I will own the launch checklist."
+    },
+    {
+      "id": "release-blocker",
+      "memory_id": "planning",
+      "speaker": "Ben",
+      "start_ts": 30,
+      "end_ts": 44,
+      "said_text": "Aurora's staging deployment is blocked by error ERR-4127. The recovery step is to rotate the staging certificate."
+    },
+    {
+      "id": "screen-budget",
+      "memory_id": "planning",
+      "speaker": "SPEAKER_0",
+      "start_ts": 50,
+      "end_ts": 60,
+      "on_screen_text": "Aurora approved budget: 42 credits. Cost center: LAB-7."
+    },
+    {
+      "id": "other-project",
+      "memory_id": "planning",
+      "project_id": "other",
+      "speaker": "Ada",
+      "start_ts": 12,
+      "end_ts": 24,
+      "said_text": "The Aurora release in this project ships on December 2, not July. The approved budget is 900 credits."
+    },
+    {
+      "id": "lunch",
+      "memory_id": "social",
+      "speaker": "Cara",
+      "start_ts": 1,
+      "end_ts": 9,
+      "said_text": "We will order mushroom soup for lunch next Tuesday. Please reserve the cafe table."
+    },
+    {
+      "id": "distractor-database",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 100,
+      "end_ts": 110,
+      "said_text": "The database cleanup uses a weekly retention job. Archive logs after ninety days."
+    },
+    {
+      "id": "distractor-performance",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 120,
+      "end_ts": 130,
+      "said_text": "The rendering benchmark measured eighty frames per second. We will optimize texture loading."
+    },
+    {
+      "id": "distractor-hiring",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 140,
+      "end_ts": 150,
+      "said_text": "The hiring committee will interview two designers next month. Jules owns candidate scheduling."
+    },
+    {
+      "id": "distractor-localization",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 160,
+      "end_ts": 170,
+      "said_text": "The translation rollout adds Polish and Finnish strings. Review the plural rules before merging."
+    },
+    {
+      "id": "distractor-network",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 180,
+      "end_ts": 190,
+      "said_text": "The office router needs a firmware upgrade. The maintenance slot is Saturday at noon."
+    },
+    {
+      "id": "distractor-accessibility",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 200,
+      "end_ts": 210,
+      "said_text": "Keyboard navigation needs visible focus rings. The accessibility review includes screen readers."
+    },
+    {
+      "id": "distractor-storage",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 220,
+      "end_ts": 230,
+      "said_text": "Cold backups must be tested quarterly. The restore drill uses a separate offline machine."
+    },
+    {
+      "id": "distractor-design",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 240,
+      "end_ts": 250,
+      "said_text": "The settings page will move the language selector above notification preferences."
+    },
+    {
+      "id": "distractor-testing",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 260,
+      "end_ts": 270,
+      "said_text": "Our parser tests need malformed Unicode fixtures and empty-file cases."
+    },
+    {
+      "id": "distractor-travel",
+      "memory_id": "engineering",
+      "speaker": "Dana",
+      "start_ts": 280,
+      "end_ts": 290,
+      "said_text": "The team retreat is in the mountains. Take the morning train from the central station."
+    }
+  ],
+  "cases": [
+    {
+      "id": "release-date",
+      "question": "When does Aurora ship?",
+      "project": "default",
+      "expected_segment_ids": [
+        "release-date"
+      ],
+      "should_abstain": false,
+      "expected_phrases": [
+        "July",
+        "17"
+      ]
+    },
+    {
+      "id": "owner",
+      "question": "Who owns the Aurora launch checklist?",
+      "project": "default",
+      "expected_segment_ids": [
+        "release-date"
+      ],
+      "should_abstain": false,
+      "expected_phrases": [
+        "Ada"
+      ]
+    },
+    {
+      "id": "exact-error",
+      "question": "ERR-4127",
+      "project": "default",
+      "expected_segment_ids": [
+        "release-blocker"
+      ],
+      "should_abstain": false,
+      "expected_phrases": [
+        "certificate"
+      ]
+    },
+    {
+      "id": "screen-only",
+      "question": "What is the approved Aurora budget?",
+      "project": "default",
+      "expected_segment_ids": [
+        "screen-budget"
+      ],
+      "should_abstain": false,
+      "expected_phrases": [
+        "42"
+      ]
+    },
+    {
+      "id": "project-isolation",
+      "question": "When does Aurora ship?",
+      "project": "other",
+      "expected_segment_ids": [
+        "other-project"
+      ],
+      "should_abstain": false,
+      "expected_phrases": [
+        "December",
+        "2"
+      ]
+    },
+    {
+      "id": "absent-topic",
+      "question": "What was decided about the Mars orbital launch window?",
+      "project": "default",
+      "expected_segment_ids": [],
+      "should_abstain": true
+    },
+    {
+      "id": "empty-scope",
+      "question": "When does Aurora ship?",
+      "project": "missing-project",
+      "expected_segment_ids": [],
+      "should_abstain": true
+    },
+    {
+      "id": "speaker-filter",
+      "question": "What blocks the staging deployment?",
+      "project": "default",
+      "speaker": "Ada",
+      "expected_segment_ids": [],
+      "should_abstain": true
+    }
+  ]
+}

@@ -1,8 +1,11 @@
+import math
 import re
 from dataclasses import dataclass
 
 import imagehash
 from PIL import Image
+
+from vproc.errors import IngestError
 
 
 @dataclass
@@ -27,8 +30,18 @@ def ffmpeg_sample_cmd(video: str, out_dir: str, log_path: str, scene: float = 0.
 
 
 def parse_frames_log(log_text: str, frame_paths: list[str]) -> list[RawFrame]:
-    times = [float(x) for x in re.findall(r"pts_time:([0-9.]+)", log_text)]
+    # FFmpeg may use exponent notation. Missing metadata must not shift later
+    # screenshots onto earlier times or silently turn a partial extraction into success.
+    try:
+        times = [float(x) for x in re.findall(r"\bpts_time:(\S+)", log_text)]
+    except ValueError:
+        raise IngestError("Invalid frame timestamp in FFmpeg metadata") from None
+    if (any(not math.isfinite(t) or t < 0 for t in times)
+            or any(a > b for a, b in zip(times, times[1:]))):
+        raise IngestError("Invalid frame timestamp order in FFmpeg metadata")
     paths = sorted(frame_paths)
+    if len(paths) != len(times):
+        raise IngestError("FFmpeg frame files and metadata counts differ; refusing incomplete extraction")
     return [RawFrame(path=p, t=t) for p, t in zip(paths, times)]
 
 
@@ -37,7 +50,8 @@ def phash_dedup(frames: list[RawFrame], threshold: int = 6, floor_s: float = 30.
     last_hash = None
     last_t = None
     for f in frames:
-        h = imagehash.phash(Image.open(f.path))
+        with Image.open(f.path) as image:
+            h = imagehash.phash(image)
         changed = last_hash is None or (h - last_hash) > threshold
         anchor = last_t is None or (f.t - last_t) >= floor_s
         if changed or anchor:

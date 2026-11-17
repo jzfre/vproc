@@ -160,3 +160,21 @@ def test_transcript_segments_are_sorted_for_chronological_chunking():
         {"start": 0, "end": 1, "text": "first"},
     ]})
     assert [seg.text for seg in segments] == ["first", "second"]
+
+
+@pytest.mark.parametrize("result", [None, [], {"segments": None}, {"segments": "broken"},
+                                    {"segments": [None]}, {"segments": [{"text": 42}]}])
+def test_malformed_asr_shape_has_a_clean_error(result):
+    from vproc.errors import IngestError
+    with pytest.raises(IngestError, match="ASR"):
+        segments_from_whisper(result)
+
+
+def test_word_retry_warning_does_not_expose_private_exception(capsys):
+    def flaky(*args, **kwargs):
+        if kwargs["word_timestamps"]:
+            raise RuntimeError("https://private.example/?token=secret transcript")
+        return {"segments": []}
+    assert transcribe("a.wav", transcriber=flaky) == []
+    message = capsys.readouterr().err
+    assert "RuntimeError" in message and "secret" not in message

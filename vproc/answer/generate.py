@@ -1,4 +1,5 @@
 import json
+import re
 
 from vproc.llm import client
 
@@ -40,21 +41,32 @@ ANSWER_SCHEMA = {
 
 
 def _parse(raw: str) -> dict:
+    if not isinstance(raw, str):
+        return {}
     try:
         return json.loads(raw)
-    except Exception:
+    except (ValueError, RecursionError):
         pass
-    # Thinking models emit reasoning (often restating the schema, braces and all) around the
-    # JSON, so scan every '{' for the first object json can actually decode.
-    text = raw.replace("```json", "").replace("```", "")
+    # Some backends put tagged reasoning in content. Drafts inside those tags
+    # are never answers, including when generation stopped before the closing tag.
+    text = re.sub(r"<think>.*?(?:</think>|$)", "", raw, flags=re.S)
+    # Recover the last complete answer object from prose/fences. Skip decoded
+    # objects as a unit: braces in claim text or schema properties are not new
+    # top-level answers. A schema object before the final response must not mask it.
     dec = json.JSONDecoder()
+    answer = {}
     i = text.find("{")
     while i != -1:
         try:
-            return dec.raw_decode(text[i:])[0]
-        except Exception:
+            data, end = dec.raw_decode(text, i)
+        except (ValueError, RecursionError):
             i = text.find("{", i + 1)
-    return {"answered": False, "claims": []}
+            continue
+        if (isinstance(data, dict) and type(data.get("answered")) is bool
+                and isinstance(data.get("claims"), list)):
+            answer = data
+        i = text.find("{", end)
+    return answer
 
 
 def generate(cfg, question: str, evidence_block: str, chat=client.chat_json) -> dict:

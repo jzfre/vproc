@@ -309,3 +309,15 @@ def test_rebuilt_text_rejoins_hyphenated_words():
     seg.text = "Too time-consuming. Right."
     out = assign_speakers([seg], [SpeakerTurn(0.0, 3.2, "SPEAKER_00"), SpeakerTurn(3.2, 5.0, "SPEAKER_01")])
     assert [(s.speaker, s.text) for s in out] == [("SPEAKER_00", "Too time-consuming."), ("SPEAKER_01", "Right.")]
+
+
+def test_malformed_diarization_is_rejected_before_transcript_is_mutated():
+    import pytest
+    cases = [SpeakerTurn(float("nan"), 2, "A"), SpeakerTurn(0, float("inf"), "A"),
+             SpeakerTurn(2, 1, "A"), SpeakerTurn(-1, 1, "A"), SpeakerTurn(0, 1, ""),
+             SpeakerTurn(0, 1, "line\nbreak")]
+    for invalid in cases:
+        transcript = [_seg(0, 1), _seg(2, 3)]
+        with pytest.raises(ValueError, match="speaker turn"):
+            assign_speakers(transcript, [SpeakerTurn(0, 1, "A"), invalid])
+        assert all(s.speaker == "SPEAKER_0" for s in transcript)

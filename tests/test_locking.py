@@ -90,3 +90,76 @@ def test_symlink_alias_uses_same_lock(tmp_path):
         with pytest.raises(IndexBusyError):
             with IndexWriteLock(alias):
                 pytest.fail("directory aliases must share a lock")
+
+
+def _storage_row(sid, text):
+    return {"id": sid, "project_id": "default", "memory_id": "meeting", "speaker": "Ada",
+            "start_ts": 0., "end_ts": 1., "said_text": text, "on_screen_text": "",
+            "embed_text": text, "source_video": "synthetic.mp4", "frame_path": "", "vector": [1., 0.]}
+
+
+def _pause_replacement(path, phase, connection):
+    from vproc.store.lancedb_store import Store
+
+    store = Store(path)
+    with store.write_lock():
+        if phase == "before_commit":
+            connection.send("paused")
+            connection.recv()
+        else:
+            # The row transaction has committed when FTS rebuild starts. Simulate
+            # process death there, before the writer reports a successful return.
+            def pause_fts(table):
+                connection.send("paused")
+                connection.recv()
+            store._rebuild_fts = pause_fts
+        store.replace_memory("meeting", "default", [_storage_row("new", "new evidence")], "m")
+
+
+@pytest.mark.parametrize("phase", ["before_commit", "after_commit"])
+def test_interrupted_real_replacement_is_atomic_and_releases_writer(tmp_path, phase):
+    from vproc.errors import IndexBusyError
+    from vproc.store.lancedb_store import Store
+
+    path = str(tmp_path / "db")
+    reader = Store(path)
+    reader.add([_storage_row("old", "old evidence")], embedding_model="m")
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe()
+    process = ctx.Process(target=_pause_replacement, args=(path, phase, child))
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(20), "child did not reach the transaction boundary"
+        assert parent.recv() == "paused"
+        expected = "old" if phase == "before_commit" else "new"
+        # The same reader connection sees a complete version, even while a
+        # different process owns the writer lock; it does not cache stale rows.
+        assert [r["id"] for r in reader.memory_rows("meeting", "default")] == [expected]
+        with pytest.raises(IndexBusyError):
+            reader.replace_memory("meeting", "default", [_storage_row("contender", "x")], "m")
+        process.terminate()
+        process.join(timeout=10)
+        assert not process.is_alive()
+        reopened = Store(path)
+        assert [r["id"] for r in reopened.vector_search([1., 0.], 5, embedding_model="m")] == [expected]
+        # A killed writer releases its OS lock and leaves the next transaction usable.
+        reopened.replace_memory("meeting", "default", [_storage_row("recovered", "recovered evidence")], "m")
+        assert [r["id"] for r in reader.memory_rows("meeting", "default")] == ["recovered"]
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+        parent.close()
+
+
+def test_release_preserves_the_lock_file(tmp_path):
+    from vproc.locking import IndexWriteLock
+
+    lock = IndexWriteLock(tmp_path / "index")
+    path = tmp_path / "index" / ".vproc-write.lock"
+    with lock:
+        before = path.stat().st_ino
+    assert path.exists() and path.stat().st_ino == before
+    with lock:
+        assert path.stat().st_ino == before

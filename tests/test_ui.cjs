@@ -285,3 +285,49 @@ test('an ask that fails immediately does not claim the server is still working o
   assert.doesNotMatch(ui.node('qa-results').innerHTML, /may still be finishing/);
   assert.equal(ui.node('qa-go').disabled, false);
 });
+
+test('UI queries stay in the default project shown by the player', async () => {
+  const ui = await viewer();
+  const bodies = [];
+  const fetch = ui.context.fetch;
+  ui.context.fetch = async (url, opts) => {
+    if (url === '/ask' || url === '/search') {
+      bodies.push(JSON.parse(opts.body));
+      return response(url === '/ask' ? {answered: false, abstained: true} : []);
+    }
+    return fetch(url, opts);
+  };
+  for (const mode of ['ask', 'search']) {
+    ui.node('qa-mode').value = mode;
+    ui.node('qa-input').value = 'same meeting title exists in another project';
+    await ui.context.runQuery();
+  }
+  assert.deepEqual(bodies.map(body => body.project), ['default', 'default']);
+});
+
+test('a stalled search can also stop waiting and unlock the controls', async () => {
+  const ui = await viewer();
+  ui.node('qa-mode').value = 'search';
+  ui.node('qa-input').value = 'release';
+  ui.node('qa-stop').hidden = true;
+  ui.requests.set('/search', deferred());
+  const request = ui.context.runQuery();
+  assert.equal(ui.node('qa-stop').hidden, false);
+  ui.node('qa-stop').listeners.get('click')();
+  await request;
+  assert.equal(ui.node('qa-go').disabled, false);
+  assert.match(ui.node('qa-results').innerHTML, /Stopped waiting/);
+  assert.doesNotMatch(ui.node('qa-results').innerHTML, /queue behind/);
+});
+
+test('model text and citation identities render as escaped text', async () => {
+  const ui = await viewer();
+  const attack = '\"><img src=x onerror=alert(1)>';
+  ui.context.renderAskResult({answered: true, claims: [{text: attack, citations: [
+    {memory_title: attack, speaker: attack, start_ts: 0}]}]});
+  assert.doesNotMatch(ui.node('qa-results').innerHTML, /<img/);
+  assert.match(ui.node('qa-results').innerHTML, /&lt;img/);
+  ui.context.renderSearchResults([{memory_title: attack, speaker: attack, text: attack, start_ts: 0, end_ts: 1}]);
+  assert.doesNotMatch(ui.node('qa-results').innerHTML, /<img/);
+  assert.match(ui.node('qa-results').innerHTML, /&quot;/);
+});

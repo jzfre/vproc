@@ -130,8 +130,9 @@ def sample_name_votes(video_path: str, turns: list[SpeakerTurn], cfg, probe=None
             longest = sorted(spk_turns, key=lambda t: t.end - t.start, reverse=True)
             for turn in longest[:MAX_PROBES_PER_SPEAKER]:
                 mid = (turn.start + turn.end) / 2.0
-                frame = os.path.join(work, f"{speaker}-{int(mid * 1000)}.png")
                 attempted += 1
+                # Speaker labels are model data, never filesystem paths.
+                frame = os.path.join(work, f"probe-{attempted}.png")
                 try:
                     _frame_at(video_path, mid, frame)
                     name, visible = _parse_vote(probe(frame))

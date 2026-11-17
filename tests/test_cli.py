@@ -258,3 +258,36 @@ def test_speakers_list_shows_who_each_label_is_without_a_sidecar(tmp_path, monke
     assert '00:00 "one two three four five six seven eight nine ten eleven twelve..."' in out
     assert "--set" in out  # says how to rename
     assert "SPEAKER_0:" not in out and '""' not in out
+
+
+def test_model_backend_failure_is_sanitized_at_cli_boundary(monkeypatch, capsys):
+    import httpx
+    from openai import APIConnectionError
+
+    def fail(args):
+        raise APIConnectionError(message="credential-and-transcript", request=httpx.Request("POST", "http://example.test"))
+
+    monkeypatch.setattr(cli, "_main", fail)
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert "APIConnectionError" in output.err
+    assert "credential-and-transcript" not in output.err
+
+
+def test_speaker_sidecar_write_failure_reports_committed_rename(tmp_path, monkeypatch, capsys):
+    mem_dir, fake = _setup(tmp_path, monkeypatch)
+    before = N.load_speaker_map(mem_dir)
+
+    def fail(*args):
+        raise OSError("sidecar disk failure")
+
+    monkeypatch.setattr(N, "save_speaker_map", fail)
+    monkeypatch.setattr("sys.argv", ["vproc", "speakers", "standup", "--set", "SPEAKER_02=Ada"])
+    cli.main()
+    assert fake.renames == [("standup", "default", "SPEAKER_02", "Ada")]
+    assert N.load_speaker_map(mem_dir) == before
+    output = capsys.readouterr()
+    assert "renamed" in output.out
+    assert "index was updated" in output.err and "speaker map" in output.err

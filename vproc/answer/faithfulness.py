@@ -31,9 +31,10 @@ def filter_claims(claims: list[dict], evidence_by_key: dict[str, Evidence],
     valid gate score (kept or not) so callers can report numbers without claim text."""
     kept: list[dict] = []
     for claim in claims:
-        premise = "\n".join(
-            evidence_text(evidence_by_key[k]) for k in claim["evidence_ids"] if k in evidence_by_key
-        )
+        # Repeating an ID cannot supply additional evidence. It used to repeat
+        # the premise (changing HHEM's score/context) and duplicate citations.
+        ids = list(dict.fromkeys(k for k in claim["evidence_ids"] if k in evidence_by_key))
+        premise = "\n".join(evidence_text(evidence_by_key[k]) for k in ids)
         if not premise:
             continue
         score = scorer(premise, claim["text"])
@@ -42,5 +43,5 @@ def filter_claims(claims: list[dict], evidence_by_key: dict[str, Evidence],
             if scores is not None:
                 scores.append(float(score))
             if score >= threshold:
-                kept.append(claim)
+                kept.append({**claim, "evidence_ids": ids})
     return kept

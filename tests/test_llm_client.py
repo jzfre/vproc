@@ -288,7 +288,7 @@ def test_transcribe_audio_calls_asr_endpoint(tmp_path, monkeypatch):
     out = c.transcribe_audio("http://x/v1", "whisper-1", str(wav))
     assert cap["model"] == "whisper-1"
     assert cap["response_format"] == "verbose_json"
-    assert cap["timeout"] == 3600 and cap["max_retries"] == 0
+    assert cap["timeout"].read == 3600 and cap["max_retries"] == 0
     assert out == {"segments": [
         {"start": 0.0, "end": 1.0, "text": "hello"},
         {"start": 1.0, "end": 2.0, "text": "world"},
@@ -388,3 +388,74 @@ def test_embed_texts_rejects_zero_vector_from_backend(monkeypatch):
     monkeypatch.setattr(c, "_client", lambda _: fake)
     with pytest.raises(ValueError, match="embedding.*vector"):
         c.embed_texts("u", "m", ["a real transcript chunk"])
+
+
+def test_asr_timeout_keeps_connection_failure_short(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(c, "_client", lambda _: _FakeAudioClient(captured, SimpleNamespace(segments=[])))
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"placeholder")
+    c.transcribe_audio("http://asr/v1", "asr", str(wav))
+    assert captured["timeout"].read == 3600.0
+    assert captured["timeout"].connect == 5.0
+    assert captured["max_retries"] == 0
+
+
+def test_concurrent_first_requests_share_one_client_pool(monkeypatch):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    start = threading.Barrier(8)
+    created = []
+
+    def constructor(**kwargs):
+        # Let all contenders reach the uninitialized cache before construction finishes.
+        time.sleep(0.02)
+        instance = object()
+        created.append(instance)
+        return instance
+
+    monkeypatch.setattr(c, "OpenAI", constructor)
+    monkeypatch.setattr(c, "_clients", {})
+    monkeypatch.setattr(c, "_api_keys", {})
+
+    def request(_):
+        start.wait(timeout=5)
+        return c._client("http://pool/v1")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        clients = list(pool.map(request, range(8)))
+    assert len(created) == 1
+    assert all(client is clients[0] for client in clients)
+
+
+def test_client_pool_normalizes_trailing_slash(monkeypatch):
+    monkeypatch.setattr(c, "OpenAI", lambda **kw: object())
+    monkeypatch.setattr(c, "_clients", {})
+    assert c._client("http://pool/v1") is c._client("http://pool/v1/")
+
+
+def test_embedding_probe_can_bound_timeout_without_retries(monkeypatch):
+    captured = {}
+
+    class Quick(_FakeClient):
+        def with_options(self, **kwargs):
+            captured.update(kwargs)
+            return self
+
+    monkeypatch.setattr(c, "_client", lambda _: Quick({}))
+    assert c.embed_texts("u", "m", ["probe"], timeout=15.0) == [[5.0]]
+    assert captured["timeout"].read == 15.0
+    assert captured["timeout"].connect == 5.0
+    assert captured["max_retries"] == 0
+
+
+def test_large_flat_word_list_preserves_assignment_order():
+    # Long ASR responses must consume the word queue once, without dropping or reusing words.
+    count = 20000
+    segments = [{"text": f"word{i}"} for i in range(count)]
+    words = [{"word": f"word{i}", "start": i, "end": i + 1} for i in range(count)]
+    c._attach_words(segments, [SimpleNamespace(words=None) for _ in segments], words)
+    assert [seg["words"][0]["start"] for seg in segments] == list(range(count))
+    assert all(seg["words"][0]["word"] == seg["text"] for seg in segments)

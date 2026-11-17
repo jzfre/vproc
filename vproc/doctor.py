@@ -65,7 +65,7 @@ def _default_probes() -> dict:
         return [m.id for m in quick(base_url).models.list().data]
 
     def embed(cfg):
-        return len(client.embed_texts(cfg.embed.base_url, cfg.embed.model, ["vproc doctor"])[0])
+        return len(client.embed_texts(cfg.embed.base_url, cfg.embed.model, ["vproc doctor"], timeout=15.0)[0])
 
     def chat(cfg):
         quick(cfg.grounding.base_url).chat.completions.create(

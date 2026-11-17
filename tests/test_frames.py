@@ -77,3 +77,28 @@ def test_ffmpeg_writes_metadata_in_directory_with_filter_special_characters(tmp_
     frames = parse_frames_log(log.read_text(), [str(p) for p in out.glob("*.png")])
     assert len(frames) == 1
     assert frames[0].t == 0.0
+
+
+def test_parse_frames_log_accepts_scientific_timestamps():
+    frames = parse_frames_log("frame:0 pts_time:0\nframe:1 pts_time:1.5e-05\n",
+                              ["/o/00000000.png", "/o/00000001.png"])
+    assert frames[1].t == 0.000015
+
+
+def test_incomplete_frame_metadata_is_not_silently_used():
+    import pytest
+    from vproc.errors import IngestError
+    for log, paths in [("pts_time:0\npts_time:1\n", ["0.png"]),
+                       ("", ["0.png"]), ("pts_time:0\n", [])]:
+        with pytest.raises(IngestError, match="frame"):
+            parse_frames_log(log, paths)
+
+
+def test_invalid_frame_timestamps_are_rejected():
+    import pytest
+    from vproc.errors import IngestError
+    for timestamp in ("NaN", "inf", "-1", "N/A"):
+        with pytest.raises(IngestError, match="timestamp"):
+            parse_frames_log(f"frame:0 pts_time:{timestamp}\n", ["0.png"])
+    with pytest.raises(IngestError, match="timestamp"):
+        parse_frames_log("frame:0 pts_time:2\nframe:1 pts_time:1\n", ["0.png", "1.png"])

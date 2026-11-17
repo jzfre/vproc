@@ -45,12 +45,13 @@ KNOWN_ENV = frozenset(
     | {"VPROC_INDEX_PATH", "VPROC_FRAMES_DIR", "VPROC_HOST", "VPROC_PORT", "VPROC_SIM_FLOOR",
        "VPROC_HHEM_THRESHOLD", "VPROC_HHEM_MODEL", "VPROC_OCR_TIMEOUT", "VPROC_OCR_MAX_TOKENS",
        "VPROC_GROUNDING_MAX_TOKENS", "VPROC_GROUNDING_THINKING", "VPROC_DIARIZE_MODEL",
-       "VPROC_SPEAKER_NAMING", "VPROC_EMBED_QUERY_PREFIX", "VPROC_ASK_URL"})
+       "VPROC_SPEAKER_NAMING", "VPROC_EMBED_QUERY_PREFIX", "VPROC_ASK_URL",
+       "VPROC_MAX_CONCURRENT_QUERIES"})
 
 
 @dataclass(frozen=True)
 class Endpoint:
-    base_url: str
+    base_url: str = field(repr=False)  # may contain URL userinfo; doctor renders a safe URL
     model: str
     # Optional bearer key for an authenticated server (e.g. vLLM --api-key). Kept out of
     # repr so a logged or printed Config can never leak it.
@@ -71,7 +72,7 @@ class Config:
     port: int
     sim_floor: float
     hhem_threshold: float
-    hf_token: str | None
+    hf_token: str | None = field(repr=False)
     # Transcription is configurable like the other functions: an empty base_url means
     # local in-process whisper; a base_url means an OpenAI-compatible ASR endpoint.
     transcribe: Endpoint = Endpoint("", DEFAULT_TRANSCRIBE_MODEL)
@@ -92,6 +93,7 @@ class Config:
     # changing it needs no re-ingest. Instruction-tuned embedders document one (Qwen3-Embedding:
     # "Instruct: <task>\nQuery: "). It shifts similarity values: re-check sim_floor after changing it.
     embed_query_prefix: str = ""
+    max_concurrent_queries: int = 4  # shared REST/MCP model work; excess requests fail fast
 
     def __post_init__(self) -> None:
         for name, minimum, maximum in (("sim_floor", -1, 1), ("hhem_threshold", 0, 1)):
@@ -102,7 +104,7 @@ class Config:
         if (not isinstance(self.ocr_timeout, (int, float)) or isinstance(self.ocr_timeout, bool)
                 or not 0 < self.ocr_timeout < float("inf")):
             raise ValueError("ocr_timeout must be positive and finite")
-        for name in ("ocr_max_tokens", "grounding_max_tokens", "port"):
+        for name in ("ocr_max_tokens", "grounding_max_tokens", "port", "max_concurrent_queries"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -202,6 +204,7 @@ def load_config() -> Config:
         grounding=_ep("VPROC_GROUNDING", "http://localhost:1234/v1", "Qwen3-32B-AWQ"),
         transcribe=_ep("VPROC_TRANSCRIBE", "", DEFAULT_TRANSCRIBE_MODEL),
         index_path=os.environ.get("VPROC_INDEX_PATH", "./vproc.lance"),
+        max_concurrent_queries=_number_env("VPROC_MAX_CONCURRENT_QUERIES", "4", int),
         host=os.environ.get("VPROC_HOST", "0.0.0.0"),
         port=_number_env("VPROC_PORT", "8765", int),
         sim_floor=_number_env("VPROC_SIM_FLOOR", "0.25", float),

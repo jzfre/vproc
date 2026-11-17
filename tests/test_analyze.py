@@ -1,4 +1,6 @@
 import json
+
+import pytest
 from types import SimpleNamespace
 
 import vproc.answer.analyze as A
@@ -41,3 +43,10 @@ def test_analyze_registers_endpoint_api_keys(monkeypatch):
     cfg = _cfg()
     A.analyze_memory(_Store([{"start_ts": 0.0, "speaker": "Ann", "said_text": "hi"}]), cfg, "m", "q")
     assert seen == [cfg]
+
+
+@pytest.mark.parametrize("answer", [None, 123, {}, [], True, " \n"])
+def test_analyze_returns_a_string_for_invalid_answer_shape(monkeypatch, answer):
+    monkeypatch.setattr(A.client, "chat_json", lambda *a, **k: json.dumps({"answer": answer}))
+    result = A.analyze_memory(_Store([{"said_text": "a meeting"}]), _cfg(), "m", "q")
+    assert result == "(model returned no answer)"

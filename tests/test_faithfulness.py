@@ -68,3 +68,19 @@ def test_hhem_load_failure_without_token_cause_still_raises(monkeypatch):
     _fake_transformers(monkeypatch, from_pretrained)
     with pytest.raises(OSError, match="missing"):
         HHEM("some/private-model")
+
+
+def test_repeated_citations_do_not_repeat_evidence_or_change_gate_scores():
+    by_key = {"E1": _ev("E1", "ships in July"), "E2": _ev("E2", "launch owner is Ada")}
+    claims = [{"text": "ships in July", "evidence_ids": ["E1", "E99", "E1", "E2", "E2"]}]
+    seen = []
+
+    def scorer(premise, hypothesis):
+        seen.append(premise)
+        return 0.9
+
+    kept = filter_claims(claims, by_key, scorer, threshold=0.5)
+    assert seen[0].count("ships in July") == 1
+    assert seen[0].count("launch owner is Ada") == 1
+    assert kept[0]["evidence_ids"] == ["E1", "E2"]
+    assert claims[0]["evidence_ids"] == ["E1", "E99", "E1", "E2", "E2"]

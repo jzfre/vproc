@@ -1,0 +1,71 @@
+{
+  "media": {
+    "duration_s": 1347.666667,
+    "sampled_frames": 11,
+    "kept_frames": 11,
+    "first_frame_s": 0.0,
+    "last_frame_s": 1344.57,
+    "frame_extract_s": 26.538,
+    "hash_s": 0.268,
+    "audio_extract_s": 3.121,
+    "frames_bytes": 3831320,
+    "audio_bytes": 43124088,
+    "ffmpeg_peak_rss_kib": 266164
+  },
+  "catalogue": {
+    "python": "3.12.14",
+    "platform": "Linux-6.8.0-147-generic-x86_64-with-glibc2.39",
+    "lancedb": "0.33.0",
+    "pyarrow": "24.0.0",
+    "rows": 10000,
+    "memories": 100,
+    "dimensions": 128,
+    "text_chars_per_field": 2000,
+    "initial_add_with_fts_seconds": 0.729083,
+    "previous_catalogue": {
+      "seconds": 0.186768,
+      "python_peak_MiB": 47.093
+    },
+    "streaming_catalogue": {
+      "seconds": 0.069182,
+      "python_peak_MiB": 0.37
+    },
+    "filtered_cosine": {
+      "seconds": 0.009652,
+      "python_peak_MiB": 0.087
+    },
+    "replace_100_or_fewer_with_fts_seconds": 0.286517
+  },
+  "load": {
+    "clients": 40,
+    "model_latency_s": 0.25,
+    "configured_capacity": 4,
+    "status_counts": {
+      "200": 4,
+      "503": 36
+    },
+    "health_status": 200,
+    "health_latency_s": 0.0199,
+    "max_rejection_s": 0.0662
+  },
+  "live_retrieval_attempt": {
+    "mode": "retrieval_only",
+    "k": 8,
+    "cases": [],
+    "error": {
+      "stage": "corpus_embedding",
+      "type": "APITimeoutError"
+    },
+    "summary": {
+      "case_count": 8,
+      "completed": 0,
+      "passed": 0,
+      "mean_recall_at_k": null,
+      "mean_abstention_correct": null,
+      "mean_citation_source_accuracy": null,
+      "mean_lexical_phrase_recall": null,
+      "total_latency_s": 16.6776
+    },
+    "passed": false
+  }
+}

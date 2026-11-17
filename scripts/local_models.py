@@ -3,12 +3,15 @@
 # dependencies = [
 #   "fastapi>=0.115",
 #   "uvicorn>=0.30",
-#   "python-multipart>=0.0.9",
+#   "python-multipart>=0.0.31",
+#   "certifi>=2026.10.19",
+#   "filelock>=4.2.1",
 #   "faster-whisper>=1.2,<2",
 #   "sentence-transformers>=5,<6",
 #   "transformers>=4.51,<5",
 #   "torch==2.12.0",
 #   "numpy>=1.26",
+#   "fsspec>=2026.6",
 # ]
 # [tool.uv.sources]
 # torch = { index = "pytorch-cpu" }
@@ -39,8 +42,13 @@ It deliberately has no chat route: vproc reaches the LLM directly (VPROC_GROUNDI
 a keyed server) and OCR is switched off with an empty VPROC_OCR_BASE_URL. It binds 127.0.0.1 and
 has no authentication. Settings: MODELS_HOST, MODELS_PORT, WHISPER_MODEL, WHISPER_THREADS,
 WHISPER_HOTWORDS, EMBED_MODEL, EMBED_THREADS.
+
+One request per model runs at a time; concurrent requests get HTTP 503 with
+Retry-After: 1 instead of queuing in the HTTP worker pool. Embedding requests
+contain at most 32 texts (the same batch size used by vproc's client).
 """
 
+from contextlib import contextmanager
 import base64
 import os
 import pathlib
@@ -73,6 +81,27 @@ app = FastAPI(title="vproc local models (CPU)")
 _models: dict[str, object] = {}
 _load_locks = {"whisper": threading.Lock(), "embed": threading.Lock()}
 _whisper_busy = threading.Lock()  # one transcription at a time; each uses most CPU threads
+_embed_busy = threading.Lock()
+EMBED_MAX_INPUTS = 32  # matches vproc's client batch; avoid unbounded request work
+
+
+@contextmanager
+def _model_slot(lock, name):
+    # Waiting in synchronous handlers would fill FastAPI's worker pool with queued
+    # model jobs, preventing even health checks from responding. Reject promptly.
+    if not lock.acquire(blocking=False):
+        raise HTTPException(503, f"{name} is busy; retry after the current request completes.",
+                            headers={"Retry-After": "1"})
+    try:
+        yield
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Model/Hub exception bodies can contain tokens, URLs, or input text.
+        print(f"[models] {name} failed ({type(exc).__name__})", file=sys.stderr, flush=True)
+        raise HTTPException(503, f"{name} failed; check the local model service.") from None
+    finally:
+        lock.release()
 
 
 def log(msg: str) -> None:
@@ -133,17 +162,17 @@ def transcriptions(
     timestamp_granularities: list[str] = Form(default=[], alias="timestamp_granularities[]"),
 ) -> Response:
     _require_model(model, WHISPER_MODEL)
-    whisper = _whisper()
-    want_words = "word" in timestamp_granularities
-    hotwords = " ".join(part for part in (WHISPER_HOTWORDS, (prompt or "").strip()) if part)
-    suffix = pathlib.Path(file.filename or "audio.wav").suffix or ".wav"
-    # delete_on_close=False: the decoder reopens the file by name, which Windows only allows
-    # then; the file is still removed when the block exits.
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete_on_close=False) as tmp:
-        while chunk := file.file.read(1 << 20):
-            tmp.write(chunk)
-        tmp.flush()
-        with _whisper_busy:
+    with _model_slot(_whisper_busy, "Transcription"):
+        whisper = _whisper()
+        want_words = "word" in timestamp_granularities
+        hotwords = " ".join(part for part in (WHISPER_HOTWORDS, (prompt or "").strip()) if part)
+        suffix = pathlib.Path(file.filename or "audio.wav").suffix or ".wav"
+        # delete_on_close=False: the decoder reopens the file by name, which Windows only allows
+        # then; the file is still removed when the block exits.
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete_on_close=False) as tmp:
+            while chunk := file.file.read(1 << 20):
+                tmp.write(chunk)
+            tmp.flush()
             t0 = time.monotonic()
             # Same anti-hallucination settings as vproc's local mlx path, plus Silero VAD so
             # silence is skipped instead of decoded (faster on CPU, fewer invented words).
@@ -168,16 +197,16 @@ def transcriptions(
             took = time.monotonic() - t0
             log(f"transcribed {len(out)} segments in {took:.0f}s "
                 f"({info.duration / max(took, 1e-6):.1f}x realtime)")
-    text = "".join(s["text"] for s in out).strip()
-    if response_format == "text":
-        return Response(text, media_type="text/plain")
-    if response_format == "verbose_json":
-        body = {"task": "transcribe", "language": info.language, "duration": info.duration,
-                "text": text, "segments": out}
-        if want_words:  # nested per segment (faster-whisper servers) and flat (OpenAI)
-            body["words"] = [w for s in out for w in s.get("words", [])]
-        return JSONResponse(body)
-    return JSONResponse({"text": text})
+        text = "".join(s["text"] for s in out).strip()
+        if response_format == "text":
+            return Response(text, media_type="text/plain")
+        if response_format == "verbose_json":
+            body = {"task": "transcribe", "language": info.language, "duration": info.duration,
+                    "text": text, "segments": out}
+            if want_words:  # nested per segment (faster-whisper servers) and flat (OpenAI)
+                body["words"] = [w for s in out for w in s.get("words", [])]
+            return JSONResponse(body)
+        return JSONResponse({"text": text})
 
 
 class EmbeddingRequest(BaseModel):
@@ -190,18 +219,19 @@ class EmbeddingRequest(BaseModel):
 def embeddings(req: EmbeddingRequest) -> dict:
     _require_model(req.model, EMBED_MODEL)
     texts = [req.input] if isinstance(req.input, str) else req.input
-    if not texts:
-        raise HTTPException(400, "input must not be empty")
-    vectors = np.asarray(_embedder().encode(texts, batch_size=32, normalize_embeddings=True,
-                                            convert_to_numpy=True), dtype=np.float32)
-    data = []
-    for i, v in enumerate(vectors):
-        # The OpenAI SDK asks for base64 by default and decodes float32 itself.
-        emb = (base64.b64encode(v.astype("<f4").tobytes()).decode()
-               if req.encoding_format == "base64" else v.tolist())
-        data.append({"object": "embedding", "index": i, "embedding": emb})
-    return {"object": "list", "data": data, "model": req.model,
-            "usage": {"prompt_tokens": 0, "total_tokens": 0}}
+    if not texts or len(texts) > EMBED_MAX_INPUTS:
+        raise HTTPException(400, f"input must contain 1 to {EMBED_MAX_INPUTS} texts")
+    with _model_slot(_embed_busy, "Embedding"):
+        vectors = np.asarray(_embedder().encode(texts, batch_size=32, normalize_embeddings=True,
+                                                convert_to_numpy=True), dtype=np.float32)
+        data = []
+        for i, v in enumerate(vectors):
+            # The OpenAI SDK asks for base64 by default and decodes float32 itself.
+            emb = (base64.b64encode(v.astype("<f4").tobytes()).decode()
+                   if req.encoding_format == "base64" else v.tolist())
+            data.append({"object": "embedding", "index": i, "embedding": emb})
+        return {"object": "list", "data": data, "model": req.model,
+                "usage": {"prompt_tokens": 0, "total_tokens": 0}}
 
 
 def _preload() -> None:
@@ -209,7 +239,7 @@ def _preload() -> None:
         try:
             load()
         except Exception as e:  # surfaced again on the first request; keep the server up
-            print(f"[models] preload failed: {e}", file=sys.stderr, flush=True)
+            print(f"[models] preload failed ({type(e).__name__})", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

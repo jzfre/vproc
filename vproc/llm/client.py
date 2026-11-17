@@ -3,12 +3,15 @@ import logging
 import math
 import mimetypes
 import wave
+from collections import deque
+from threading import Lock
 
 from openai import BadRequestError, OpenAI, Timeout, UnprocessableEntityError
 
 logger = logging.getLogger(__name__)
 _clients: dict[tuple[str, str], OpenAI] = {}
 _api_keys: dict[str, str] = {}
+_clients_lock = Lock()
 
 
 def configure(cfg) -> None:
@@ -17,23 +20,27 @@ def configure(cfg) -> None:
     key_for = getattr(cfg, "api_key_for", None)
     if key_for is None:
         return  # direct stand-in configs (tests, embedders) inject their own clients
-    for ep in (cfg.ocr, cfg.embed, cfg.grounding, cfg.transcribe):
-        key = key_for(ep.base_url)
-        if key is None:
-            _api_keys.pop(ep.base_url.rstrip("/"), None)
-        else:
-            _api_keys[ep.base_url.rstrip("/")] = key
+    with _clients_lock:
+        for ep in (cfg.ocr, cfg.embed, cfg.grounding, cfg.transcribe):
+            key = key_for(ep.base_url)
+            if key is None:
+                _api_keys.pop(ep.base_url.rstrip("/"), None)
+            else:
+                _api_keys[ep.base_url.rstrip("/")] = key
 
 
 def _client(base_url: str) -> OpenAI:
     # The SDK requires an api_key; keyless local servers ignore the placeholder. Cache one
     # client per (base_url, key) so the httpx connection pool is reused instead of leaking
     # a socket per call, and a client built before configure() is never reused with a stale key.
-    key = _api_keys.get(base_url.rstrip("/"), "not-needed")
-    inst = _clients.get((base_url, key))
-    if inst is None:
-        inst = _clients[(base_url, key)] = OpenAI(base_url=base_url, api_key=key)
-    return inst
+    base_url = base_url.rstrip("/")
+    with _clients_lock:
+        key = _api_keys.get(base_url, "not-needed")
+        inst = _clients.get((base_url, key))
+        if inst is None:
+            inst = _clients[(base_url, key)] = OpenAI(base_url=base_url, api_key=key)
+        return inst
+
 
 
 # Embedding servers cap the per-request batch (TEI defaults to 32); send chunks that fit
@@ -41,12 +48,16 @@ def _client(base_url: str) -> OpenAI:
 EMBED_BATCH = 32
 
 
-def embed_texts(base_url: str, model: str, texts: list[str]) -> list[list[float]]:
+def embed_texts(base_url: str, model: str, texts: list[str], *,
+                timeout: float | None = None) -> list[list[float]]:
     out: list[list[float]] = []
     dimensions = None
     for i in range(0, len(texts), EMBED_BATCH):
         batch = texts[i:i + EMBED_BATCH]
-        resp = _client(base_url).embeddings.create(model=model, input=batch)
+        endpoint = _client(base_url)
+        if timeout is not None:
+            endpoint = endpoint.with_options(timeout=Timeout(timeout, connect=CONNECT_TIMEOUT), max_retries=0)
+        resp = endpoint.embeddings.create(model=model, input=batch)
         # The API pairs each vector to its input via `index`; list order is not contractual.
         # Reject incomplete/duplicate batches before callers can pair them with segments.
         if (not isinstance(resp.data, list) or len(resp.data) != len(batch)
@@ -153,11 +164,11 @@ def _attach_words(out: list[dict], segs, flat) -> None:
                 if words:
                     seg["words"] = [_word(w) for w in words]
             return
-        pending = [_word(w) for w in flat or []]
+        pending = deque(_word(w) for w in flat or [])
         for seg in out:
             target, spelled, taken = squash(seg["text"]), "", []
             while pending and len(spelled) < len(target):
-                taken.append(pending.pop(0))
+                taken.append(pending.popleft())
                 spelled += squash(taken[-1]["word"])
             if spelled != target:
                 return  # misaligned from here on; earlier segments keep their words
@@ -174,7 +185,8 @@ def transcribe_audio(base_url: str, model: str, audio_path: str) -> dict:
         with open(audio_path, "rb") as f:
             # Hour-long meetings exceed the SDK's 600s default; max_retries=0 so a slow response
             # doesn't silently re-upload the ~100MB wav two more times.
-            return _client(base_url).with_options(timeout=3600, max_retries=0).audio.transcriptions.create(
+            return _client(base_url).with_options(
+                timeout=Timeout(3600.0, connect=CONNECT_TIMEOUT), max_retries=0).audio.transcriptions.create(
                 model=model, file=f, response_format="verbose_json", **extra)
 
     try:
